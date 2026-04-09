@@ -63,6 +63,8 @@ read_timeout_node: *ClientNode,
 client_type: ConnectionType = .HTTP,
 state: State = .Open,
 ws: ?*Websocket = null,
+pending: ?[]const u8 = null,
+
 
 pub fn init(arena: Allocator, socket: posix.socket_t, address: std.net.Address, kqueue: *KQueue) !Client {
     // const reader = try Reader.init(arena, 4096);
