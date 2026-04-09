@@ -336,9 +336,12 @@ fn sendFrameInternal(client: *Client, opcode: Opcode, payload: []const u8, compr
         i += 8;
     }
 
+    // Buffer the small frame header without sending, then write the
+    // payload — `write` flushes both header and payload as a single
+    // logical message and transparently chunks oversized payloads
+    // through `pending` if they don't fit in the writer buffer.
     try client.fillWriteBuffer(header[0..i]);
-    try client.fillWriteBuffer(payload);
-    _ = try client.writeMessage();
+    try client.write(payload);
 }
 
 pub fn sendFrame(client: *Client, opcode: Opcode, payload: []const u8) !void {

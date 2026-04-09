@@ -313,9 +313,10 @@ pub fn Loom(comptime Handler: type) type {
                                     };
                                 }
                             } else if (filter == system.EVFILT.WRITE) {
-                                //////////////////////////////////////////////////////////////////////////////////
-                                client.writeMessage() catch {
-                                    // std.debug.print("Write error: {any}\n", .{err});
+                                // Drive the write state machine forward. On
+                                // completion this also flips the client back
+                                // to read mode for the next keep-alive request.
+                                client.continueWrite() catch {
                                     loom.closeClient(client);
                                 };
                             }
@@ -416,6 +417,11 @@ pub fn Loom(comptime Handler: type) type {
         }
 
         pub fn closeClient(self: *Loom(Handler), client: *Client) void {
+            if (client.pending_file) |f| {
+                f.close();
+                client.pending_file = null;
+            }
+
             // --- NEW LOGIC: RETURN FIBER TO POOL ---
             // We MUST reset the fiber before putting it back,
             // in case it died with an error.
