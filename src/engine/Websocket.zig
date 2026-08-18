@@ -336,9 +336,12 @@ fn sendFrameInternal(client: *Client, opcode: Opcode, payload: []const u8, compr
         i += 8;
     }
 
+    // Buffer the small frame header without sending, then write the
+    // payload — `write` flushes both header and payload as a single
+    // logical message and transparently chunks oversized payloads
+    // through `pending` if they don't fit in the writer buffer.
     try client.fillWriteBuffer(header[0..i]);
-    try client.fillWriteBuffer(payload);
-    _ = try client.writeMessage();
+    try client.write(payload);
 }
 
 pub fn sendFrame(client: *Client, opcode: Opcode, payload: []const u8) !void {
@@ -442,9 +445,7 @@ pub fn buildUpgradeResponse(
     result: HandshakeResult,
     buffer: []u8,
 ) ![]u8 {
-    var fbs = std.io.fixedBufferStream(buffer);
-    const writer = fbs.writer();
-
+    var writer = std.Io.Writer.fixed(buffer);
     try writer.writeAll("HTTP/1.1 101 Switching Protocols\r\n");
     try writer.writeAll("Upgrade: websocket\r\n");
     try writer.writeAll("Connection: Upgrade\r\n");
@@ -463,7 +464,7 @@ pub fn buildUpgradeResponse(
 
     try writer.writeAll("\r\n");
 
-    return fbs.getWritten();
+    return writer.buffered();
 }
 
 /// Example usage in your server's connection handler

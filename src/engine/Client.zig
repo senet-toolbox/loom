@@ -3,10 +3,6 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const KQueue = @import("KQueue.zig");
 const Loom = @import("Loom.zig");
-const Fiber = @import("async/Fiber.zig");
-const Stack = @import("async/types.zig").Stack;
-const Scheduler = @import("async/Scheduler.zig");
-const xsuspend = Scheduler.xsuspend;
 const Websocket = @import("Websocket.zig");
 
 const State = enum {
@@ -31,20 +27,29 @@ const ConnectionType = enum {
     WebSocket,
 };
 
+/// Deadline-ordered list of connections, maintained by the server.
 pub const ClientList = std.DoublyLinkedList;
-pub const ClientNode = struct {
-    node: ClientList.Node,
-    data: *Client,
-};
 
 pub const Client = @This();
 kqueue: *KQueue,
 
 socket: posix.socket_t,
-address: std.net.Address,
-fiber: ?*Fiber = null,
+address: std.Io.net.IpAddress,
+
+/// Dense connection-slot index in `0..config.max`, handed out by the
+/// server on accept and returned to the free list on close. Stable for
+/// the lifetime of the connection, so downstream layers can use it to
+/// key their own per-connection state.
+///
+/// Named for the fiber pool it used to index; kept for API
+/// compatibility and due for a rename to `slot`.
 fiber_index: usize = 0,
-stack: ?Stack = undefined,
+
+/// Set the moment the server decides this connection is done. The
+/// client stays allocated until the end of the current event batch, so
+/// any further events in that batch can be recognised as stale and
+/// skipped instead of touching a freed client.
+closing: bool = false,
 
 // Used to read length-prefixed messages
 msg: []const u8,
@@ -53,20 +58,32 @@ msg: []const u8,
 writer: Writer,
 response: []const u8,
 
-// absolute time, in millisecond, when this client should timeout if
-// a message isn't received
+/// Absolute time, in milliseconds, past which this connection is dropped
+/// if it has made no progress. Refreshed by the server on every read and
+/// on every write that drains.
 read_timeout: i64,
 
-// Node containing this client in the server's read_timeout_list
-read_timeout_node: *ClientNode,
+/// Intrusive link into the server's deadline-ordered timeout list.
+///
+/// Embedded rather than separately allocated: the node's lifetime is
+/// exactly the client's, so a side allocation bought nothing but an
+/// extra pool and one more thing to forget to free.
+timeout_node: ClientList.Node = .{},
 
 client_type: ConnectionType = .HTTP,
 state: State = .Open,
 ws: ?*Websocket = null,
+io: std.Io = undefined,
+// Overflow tail of an in-flight slice send. While non-null, the
+// client is mid-async-send and refuses new writes.
 pending: ?[]const u8 = null,
+// In-flight file send. Owned by the client while non-null — closed
+// on EOF, on error, or when the client disconnects. Drained by the
+// pump after `pending` (so a `write(headers); sendFile(file)`
+// sequence sends in the right order).
+pending_file: ?std.Io.File = null,
 
-
-pub fn init(arena: Allocator, socket: posix.socket_t, address: std.net.Address, kqueue: *KQueue) !Client {
+pub fn init(arena: Allocator, io: std.Io, socket: posix.socket_t, address: std.Io.net.IpAddress, kqueue: *KQueue) !Client {
     // const reader = try Reader.init(arena, 4096);
     // errdefer reader.deinit(arena);
 
@@ -84,7 +101,7 @@ pub fn init(arena: Allocator, socket: posix.socket_t, address: std.net.Address, 
         .writer = writer,
         .response = "",
         .read_timeout = 0, // let the server set this
-        .read_timeout_node = undefined, // hack/ugly, let the server set this when init returns
+        .io = io,
     };
 }
 
@@ -168,8 +185,13 @@ pub fn findCRLFCRLF(payload: []const u8) ?usize {
     return null;
 }
 
-// pub var reader_buf: [2097152]u8 = [_]u8{0} ** 2097152;
-pub var reader_buf: []u8 = undefined;
+/// Scratch buffer every client reads into, sized from
+/// `Config.max_read_size` and owned by the server.
+///
+/// NOTE: process-global and therefore shared by every connection. The
+/// slice handed to the handler stays valid only until the next read on
+/// any client — see the lifetime note on `write`.
+pub var reader_buf: []u8 = &.{};
 pub fn readMessage(self: *Client) ![]const u8 {
     // return self.reader.readMessage(self.socket) catch |err| {
     //     // try Loom.logger.err("Read msg {any}", .{err}, @src());
@@ -195,107 +217,143 @@ pub fn readMessage(self: *Client) ![]const u8 {
     return reader_buf[0..rv];
 }
 
-pub fn writeMessage(self: *Client) !void {
-    self.writer.writeMessage(self.socket) catch |err| {
-        switch (err) {
+/// True while a previous send is still draining — either there's
+/// overflow waiting in `pending`, or the writer buffer hasn't been
+/// fully flushed yet. New writes are rejected in this state.
+pub fn isWriting(self: *const Client) bool {
+    return self.pending != null or self.pending_file != null or self.writer.offset < self.writer.pos;
+}
+
+/// Append `msg` to the writer buffer (overflow goes into `pending`)
+/// then drive the write state machine forward as far as the kernel
+/// will accept right now.
+///
+/// Returns synchronously in two cases:
+///   - Everything sent in one go (fast path for small responses).
+///   - Kernel returned EAGAIN; `EVFILT.WRITE` has been armed and the
+///     event loop will resume the send via `continueWrite` when the
+///     socket becomes writable.
+///
+/// Returns `error.WriteInProgress` if a previous async send is still
+/// in flight — the caller must wait for it to drain before queuing
+/// the next message.
+///
+/// Lifetime: the caller must ensure `msg` outlives the write. If
+/// `msg` does not fit in the writer buffer, a slice into it is
+/// stashed as `pending` until later draining. For dynamically
+/// allocated payloads, hold the backing storage until the next
+/// READ event arrives on this client (which guarantees the previous
+/// response has been fully sent).
+pub fn write(self: *Client, msg: []const u8) !void {
+    if (self.pending != null or self.pending_file != null) return error.WriteInProgress;
+
+    const room = self.writer.buf.len - self.writer.pos;
+    const take = @min(msg.len, room);
+    try self.writer.fillWriteBuffer(msg[0..take]);
+    if (take < msg.len) {
+        self.pending = msg[take..];
+    }
+
+    try self.pumpWrite();
+}
+
+/// Alias for `write`. Both functions transparently chunk arbitrarily
+/// large payloads through the fixed-size writer buffer; the name is
+/// kept for callers that want to make streaming intent explicit.
+pub fn chunked(self: *Client, payload: []const u8) !void {
+    return self.write(payload);
+}
+
+/// Append `msg` to the writer buffer without triggering a send.
+/// Useful when coalescing multiple small writes (e.g. a websocket
+/// frame header followed by its payload) into a single syscall —
+/// pair with a subsequent `write(...)` call to flush.
+pub fn fillWriteBuffer(self: *Client, msg: []const u8) !void {
+    if (self.pending != null or self.pending_file != null) return error.WriteInProgress;
+    return self.writer.fillWriteBuffer(msg);
+}
+
+/// Begin asynchronously streaming a file through the write pump.
+/// Ownership transfers to the client on success and the file is
+/// closed on EOF, on send error, or when the client disconnects.
+pub fn sendFile(self: *Client, file: std.Io.File) !void {
+    if (self.pending_file != null) return error.WriteInProgress;
+
+    self.pending_file = file;
+    errdefer {
+        if (self.pending_file) |f| {
+            f.close(self.io);
+            self.pending_file = null;
+        }
+    }
+
+    try self.pumpWrite();
+}
+
+/// Drive the writer state machine forward. On EAGAIN (or partial
+/// write), arms `EVFILT.WRITE` so the event loop will resume the
+/// send when the socket is writable. Used internally by `write`
+/// and `continueWrite`.
+fn pumpWrite(self: *Client) !void {
+    while (true) {
+        // Drain whatever is currently in the writer buffer.
+        self.writer.writeMessage(self.socket) catch |err| switch (err) {
             error.WouldBlock => {
-                // Arm for WRITE notifications
-                return err;
-            },
-            error.BrokenPipe, error.ConnectionResetByPeer => {
-                // std.debug.print("client disconnected\n", .{});
-                // Client disconnected - DON'T try to resume
-                // Just return the error and let the event loop clean up
-                return err;
+                // Either kernel EAGAIN or a partial write. Park the
+                // rest until the socket is writable. EVFILT.WRITE is
+                // level-triggered for this client so a single arm is
+                // enough — kqueue will keep firing as long as there's
+                // send-buffer space.
+                try self.kqueue.writeMode(self);
+                return;
             },
             else => return err,
+        };
+        // Writer fully drained. If there's overflow in `pending`,
+        // refill the writer buffer and try to drain again.
+        if (self.pending) |p| {
+            const take = @min(p.len, self.writer.buf.len);
+            try self.writer.fillWriteBuffer(p[0..take]);
+            self.pending = if (take < p.len) p[take..] else null;
+            continue;
         }
-    };
-    return; // This is the success (void) case
-}
-
-pub fn sendFile(self: *Client, file: std.fs.File) !void {
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = try file.read(buf[0..]);
-        if (n == 0) break; // EOF reached
-
-        // Fill the write buffer with the chunk
-        try self.fillWriteBuffer(buf[0..n]);
-
-        // Keep trying to write THIS chunk until complete
-        while (true) {
-            self.writeMessage() catch |err| {
-                switch (err) {
-                    error.WouldBlock => {
-                        continue; // Stay in inner loop, retry the SAME chunk
-                    },
-                    else => {
-                        return err;
-                    },
-                }
-            };
-            // Write completed, move to next chunk
-            break;
-        }
-    }
-}
-
-pub fn write(self: *Client, msg: []const u8) !void {
-    try self.fillWriteBuffer(msg);
-    while (true) {
-        self.writeMessage() catch |err| {
-            switch (err) {
-                error.WouldBlock => {
-                    continue;
+        // If there's no slice overflow left, pull the next chunk
+        // directly from an in-flight file transfer.
+        if (self.pending_file) |*file| {
+            const chunk_len = file.readStreaming(self.io, &.{self.writer.buf[0..]}) catch |err| switch (err) {
+                error.EndOfStream => {
+                    file.close(self.io);
+                    self.pending_file = null;
+                    return;
                 },
                 else => {
+                    file.close(self.io);
+                    self.pending_file = null;
                     return err;
                 },
-            }
-        };
-        // Write completed, move to next chunk
-        break;
-    }
-}
-
-pub fn chunked(self: *Client, payload: []const u8) !void {
-    var pos: usize = 0;
-    outer: while (pos < payload.len) {
-        // Calculate how much we can fit in the buffer
-        const remaining = payload.len - pos;
-        const buffer_capacity = self.writer.buf.len;
-        const chunk_size = @min(remaining, buffer_capacity);
-
-        // Fill the write buffer with the chunk
-        self.fillWriteBuffer(payload[pos .. pos + chunk_size]) catch |err| {
-            std.debug.print("Fill write buffer error: {any}\n", .{err});
-        };
-
-        // Keep trying to write this chunk until complete
-        while (true) {
-            self.writeMessage() catch |err| {
-                switch (err) {
-                    error.WouldBlock => {
-                        continue :outer;
-                    },
-                    else => {
-                        return err;
-                    },
-                }
             };
-            // Write completed, move to next chunk
-            break;
+            if (chunk_len == 0) {
+                file.close(self.io);
+                self.pending_file = null;
+                return;
+            }
+            self.writer.pos = chunk_len;
+            self.writer.offset = 0;
+            continue;
         }
-        pos += chunk_size;
+        return; // nothing more to send
     }
 }
 
-pub fn fillWriteBuffer(self: *Client, msg: []const u8) !void {
-    self.writer.fillWriteBuffer(msg) catch |err| {
-        try Loom.logger.err("Fill write buffer {any}", .{err}, @src());
-        return err;
-    };
+/// Called by the event loop when `EVFILT.WRITE` fires for this
+/// client. Drives the write state machine and, on completion, flips
+/// the client back to read mode for the next request (HTTP/1.1
+/// keep-alive).
+pub fn continueWrite(self: *Client) !void {
+    try self.pumpWrite();
+    if (!self.isWriting()) {
+        try self.kqueue.readMode(self);
+    }
 }
 
 const Reader = struct {
@@ -335,7 +393,32 @@ const Reader = struct {
     }
 };
 
-pub var writer_buf: []u8 = undefined;
+fn posixWrite(fd: i32, buf: []const u8) !usize {
+    const rc = posix.system.write(fd, buf.ptr, buf.len);
+    const e = posix.system.errno(rc);
+    if (e != .SUCCESS) return switch (e) {
+        .AGAIN => error.WouldBlock,
+        .PIPE => error.BrokenPipe,
+        .CONNRESET => error.ConnectionReset,
+        .INTR => error.Interrupted,
+        else => error.Unexpected,
+    };
+    if (rc == 0) return error.Closed;
+    return @intCast(rc);
+}
+
+fn posixRead(fd: i32, buf: []u8) !usize {
+    const rc = posix.system.read(fd, buf.ptr, buf.len);
+    const e = posix.system.errno(rc);
+    if (e != .SUCCESS) return switch (e) {
+        .AGAIN => error.WouldBlock,
+        .CONNRESET => error.ConnectionReset,
+        .INTR => error.Interrupted,
+        else => error.Unexpected,
+    };
+    if (rc == 0) return error.Closed;
+    return @intCast(rc);
+}
 
 const Writer = struct {
     buf: [65536]u8 = undefined,
@@ -369,13 +452,12 @@ const Writer = struct {
         }
 
         // Try to write remaining data
-        const wv = posix.write(socket, self.buf[self.offset..self.pos]) catch |err| {
+        const wv = posixWrite(socket, self.buf[self.offset..self.pos]) catch |err| {
             switch (err) {
                 error.WouldBlock => return error.WouldBlock,
                 else => return err,
             }
         };
-
         if (wv == 0) {
             return error.Closed;
         }

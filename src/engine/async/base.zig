@@ -42,7 +42,7 @@ comptime {
 }
 
 pub const Frame = packed struct {
-    stack_pointer: [*]u8,
+    stack_pointer: usize,
 
     const Self = @This();
     const Func = *const fn (
@@ -68,7 +68,7 @@ pub const Frame = packed struct {
         // function ptr
         const jump_ptr: *Func = @ptrCast(@alignCast(&register_space[arch_info.jump_idx * 8]));
         jump_ptr.* = func;
-        return .{ .stack_pointer = register_space.ptr };
+        return .{ .stack_pointer = @intFromPtr(register_space.ptr) };
     }
 
     /// Switch to takes a coro and a target coro to switch to
