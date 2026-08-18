@@ -1,8 +1,10 @@
 // [timestamp] [log_type] [file] string
 const std = @import("std");
+const Time = @import("Time.zig");
+const timestamp = Time.timestamp;
 
 pub const Logger = @This();
-mutex: std.Thread.Mutex,
+mutex: std.Io.Mutex,
 
 const LogLevel = enum {
     DEBUG,
@@ -24,7 +26,7 @@ const LogLevel = enum {
 
 pub fn init(target: *Logger) void {
     target.* = .{
-        .mutex = .{},
+        .mutex = .{ .state = .{ .raw = .unlocked } },
     };
 }
 
@@ -35,20 +37,21 @@ fn log(
     args: anytype,
     opt_src: ?std.builtin.SourceLocation,
 ) !void {
-    logger.mutex.lock();
-    defer logger.mutex.unlock();
+    std.Io.Threaded.mutexLock(&logger.mutex);
+    defer std.Io.Threaded.mutexUnlock(&logger.mutex);
     var buf: [1024]u8 = undefined;
     var errstream = std.Io.Writer.fixed(&buf);
     const stderr = &errstream;
 
- 
-    nosuspend stderr.print("[{d}] ", .{std.time.timestamp()}) catch return;
+    nosuspend stderr.print("[{d}] ", .{timestamp()}) catch return;
     nosuspend stderr.print("[{s}{s}\x1b[0m] ", .{ log_level.color(), @tagName(log_level) }) catch return;
     if (opt_src) |src| {
         nosuspend stderr.print("[{s}:{d}] => ", .{ src.file, src.line }) catch return;
     }
     nosuspend stderr.print(fmt, args) catch return;
     nosuspend stderr.print("\n", .{}) catch return;
+    std.debug.print("{s}", .{stderr.buffer[0..stderr.end]});
+    try stderr.flush();
 }
 
 pub fn warn(

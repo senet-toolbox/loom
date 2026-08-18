@@ -445,9 +445,7 @@ pub fn buildUpgradeResponse(
     result: HandshakeResult,
     buffer: []u8,
 ) ![]u8 {
-    var fbs = std.io.fixedBufferStream(buffer);
-    const writer = fbs.writer();
-
+    var writer = std.Io.Writer.fixed(buffer);
     try writer.writeAll("HTTP/1.1 101 Switching Protocols\r\n");
     try writer.writeAll("Upgrade: websocket\r\n");
     try writer.writeAll("Connection: Upgrade\r\n");
@@ -466,7 +464,7 @@ pub fn buildUpgradeResponse(
 
     try writer.writeAll("\r\n");
 
-    return fbs.getWritten();
+    return writer.buffered();
 }
 
 /// Example usage in your server's connection handler

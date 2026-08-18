@@ -3,10 +3,6 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const KQueue = @import("KQueue.zig");
 const Loom = @import("Loom.zig");
-const Fiber = @import("async/Fiber.zig");
-const Stack = @import("async/types.zig").Stack;
-const Scheduler = @import("async/Scheduler.zig");
-const xsuspend = Scheduler.xsuspend;
 const Websocket = @import("Websocket.zig");
 
 const State = enum {
@@ -31,20 +27,29 @@ const ConnectionType = enum {
     WebSocket,
 };
 
+/// Deadline-ordered list of connections, maintained by the server.
 pub const ClientList = std.DoublyLinkedList;
-pub const ClientNode = struct {
-    node: ClientList.Node,
-    data: *Client,
-};
 
 pub const Client = @This();
 kqueue: *KQueue,
 
 socket: posix.socket_t,
-address: std.net.Address,
-fiber: ?*Fiber = null,
+address: std.Io.net.IpAddress,
+
+/// Dense connection-slot index in `0..config.max`, handed out by the
+/// server on accept and returned to the free list on close. Stable for
+/// the lifetime of the connection, so downstream layers can use it to
+/// key their own per-connection state.
+///
+/// Named for the fiber pool it used to index; kept for API
+/// compatibility and due for a rename to `slot`.
 fiber_index: usize = 0,
-stack: ?Stack = undefined,
+
+/// Set the moment the server decides this connection is done. The
+/// client stays allocated until the end of the current event batch, so
+/// any further events in that batch can be recognised as stale and
+/// skipped instead of touching a freed client.
+closing: bool = false,
 
 // Used to read length-prefixed messages
 msg: []const u8,
@@ -53,16 +58,22 @@ msg: []const u8,
 writer: Writer,
 response: []const u8,
 
-// absolute time, in millisecond, when this client should timeout if
-// a message isn't received
+/// Absolute time, in milliseconds, past which this connection is dropped
+/// if it has made no progress. Refreshed by the server on every read and
+/// on every write that drains.
 read_timeout: i64,
 
-// Node containing this client in the server's read_timeout_list
-read_timeout_node: *ClientNode,
+/// Intrusive link into the server's deadline-ordered timeout list.
+///
+/// Embedded rather than separately allocated: the node's lifetime is
+/// exactly the client's, so a side allocation bought nothing but an
+/// extra pool and one more thing to forget to free.
+timeout_node: ClientList.Node = .{},
 
 client_type: ConnectionType = .HTTP,
 state: State = .Open,
 ws: ?*Websocket = null,
+io: std.Io = undefined,
 // Overflow tail of an in-flight slice send. While non-null, the
 // client is mid-async-send and refuses new writes.
 pending: ?[]const u8 = null,
@@ -70,10 +81,9 @@ pending: ?[]const u8 = null,
 // on EOF, on error, or when the client disconnects. Drained by the
 // pump after `pending` (so a `write(headers); sendFile(file)`
 // sequence sends in the right order).
-pending_file: ?std.fs.File = null,
+pending_file: ?std.Io.File = null,
 
-
-pub fn init(arena: Allocator, socket: posix.socket_t, address: std.net.Address, kqueue: *KQueue) !Client {
+pub fn init(arena: Allocator, io: std.Io, socket: posix.socket_t, address: std.Io.net.IpAddress, kqueue: *KQueue) !Client {
     // const reader = try Reader.init(arena, 4096);
     // errdefer reader.deinit(arena);
 
@@ -91,7 +101,7 @@ pub fn init(arena: Allocator, socket: posix.socket_t, address: std.net.Address, 
         .writer = writer,
         .response = "",
         .read_timeout = 0, // let the server set this
-        .read_timeout_node = undefined, // hack/ugly, let the server set this when init returns
+        .io = io,
     };
 }
 
@@ -175,8 +185,13 @@ pub fn findCRLFCRLF(payload: []const u8) ?usize {
     return null;
 }
 
-// pub var reader_buf: [2097152]u8 = [_]u8{0} ** 2097152;
-pub var reader_buf: []u8 = undefined;
+/// Scratch buffer every client reads into, sized from
+/// `Config.max_read_size` and owned by the server.
+///
+/// NOTE: process-global and therefore shared by every connection. The
+/// slice handed to the handler stays valid only until the next read on
+/// any client — see the lifetime note on `write`.
+pub var reader_buf: []u8 = &.{};
 pub fn readMessage(self: *Client) ![]const u8 {
     // return self.reader.readMessage(self.socket) catch |err| {
     //     // try Loom.logger.err("Read msg {any}", .{err}, @src());
@@ -261,15 +276,17 @@ pub fn fillWriteBuffer(self: *Client, msg: []const u8) !void {
 /// Begin asynchronously streaming a file through the write pump.
 /// Ownership transfers to the client on success and the file is
 /// closed on EOF, on send error, or when the client disconnects.
-pub fn sendFile(self: *Client, file: std.fs.File) !void {
+pub fn sendFile(self: *Client, file: std.Io.File) !void {
     if (self.pending_file != null) return error.WriteInProgress;
+
     self.pending_file = file;
     errdefer {
         if (self.pending_file) |f| {
-            f.close();
+            f.close(self.io);
             self.pending_file = null;
         }
     }
+
     try self.pumpWrite();
 }
 
@@ -303,13 +320,20 @@ fn pumpWrite(self: *Client) !void {
         // If there's no slice overflow left, pull the next chunk
         // directly from an in-flight file transfer.
         if (self.pending_file) |*file| {
-            const chunk_len = file.read(self.writer.buf[0..]) catch |err| {
-                file.close();
-                self.pending_file = null;
-                return err;
+            const chunk_len = file.readStreaming(self.io, &.{self.writer.buf[0..]}) catch |err| switch (err) {
+                error.EndOfStream => {
+                    file.close(self.io);
+                    self.pending_file = null;
+                    return;
+                },
+                else => {
+                    file.close(self.io);
+                    self.pending_file = null;
+                    return err;
+                },
             };
             if (chunk_len == 0) {
-                file.close();
+                file.close(self.io);
                 self.pending_file = null;
                 return;
             }
@@ -369,7 +393,32 @@ const Reader = struct {
     }
 };
 
-pub var writer_buf: []u8 = undefined;
+fn posixWrite(fd: i32, buf: []const u8) !usize {
+    const rc = posix.system.write(fd, buf.ptr, buf.len);
+    const e = posix.system.errno(rc);
+    if (e != .SUCCESS) return switch (e) {
+        .AGAIN => error.WouldBlock,
+        .PIPE => error.BrokenPipe,
+        .CONNRESET => error.ConnectionReset,
+        .INTR => error.Interrupted,
+        else => error.Unexpected,
+    };
+    if (rc == 0) return error.Closed;
+    return @intCast(rc);
+}
+
+fn posixRead(fd: i32, buf: []u8) !usize {
+    const rc = posix.system.read(fd, buf.ptr, buf.len);
+    const e = posix.system.errno(rc);
+    if (e != .SUCCESS) return switch (e) {
+        .AGAIN => error.WouldBlock,
+        .CONNRESET => error.ConnectionReset,
+        .INTR => error.Interrupted,
+        else => error.Unexpected,
+    };
+    if (rc == 0) return error.Closed;
+    return @intCast(rc);
+}
 
 const Writer = struct {
     buf: [65536]u8 = undefined,
@@ -403,13 +452,12 @@ const Writer = struct {
         }
 
         // Try to write remaining data
-        const wv = posix.write(socket, self.buf[self.offset..self.pos]) catch |err| {
+        const wv = posixWrite(socket, self.buf[self.offset..self.pos]) catch |err| {
             switch (err) {
                 error.WouldBlock => return error.WouldBlock,
                 else => return err,
             }
         };
-
         if (wv == 0) {
             return error.Closed;
         }
