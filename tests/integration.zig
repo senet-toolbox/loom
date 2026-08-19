@@ -47,10 +47,10 @@ const SlotHandler = struct {
     var handled = std.atomic.Value(u32).init(0);
 
     pub fn process(_: SlotHandler, client: *loom.Client, _: []const u8) !void {
-        if (client.fiber_index >= max_slots) {
+        if (client.slot >= max_slots) {
             _ = out_of_range.fetchAdd(1, .monotonic);
         } else {
-            _ = seen[client.fiber_index].fetchAdd(1, .monotonic);
+            _ = seen[client.slot].fetchAdd(1, .monotonic);
         }
         _ = handled.fetchAdd(1, .monotonic);
         try client.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
@@ -702,4 +702,327 @@ test "timeout bookkeeping survives churn" {
     try conn.send(harness.get_request);
     const n = try conn.recv(&buf);
     try testing.expect(std.mem.startsWith(u8, buf[0..n], "HTTP/1.1 200 OK"));
+}
+
+// ── Shutdown ───────────────────────────────────────────────────────
+
+// `serve()` used to run until it failed, with no way to ask it to stop.
+// That made a clean teardown impossible: callers could not release the
+// server's memory or its listener without killing the process.
+test "stop makes serve return" {
+    const allocator = std.heap.page_allocator;
+
+    const instance = try allocator.create(loom.Loom(EchoHandler));
+    defer allocator.destroy(instance);
+    try instance.new(.{ .max = 8, .server_addr = "127.0.0.1", .server_port = 0 }, allocator, .{});
+    defer instance.deinit();
+    try instance.bindListener();
+
+    const Runner = struct {
+        fn run(srv: *loom.Loom(EchoHandler), done: *std.atomic.Value(bool)) void {
+            srv.serve() catch {};
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ instance, &done });
+
+    // Confirm it is genuinely serving before asking it to stop.
+    {
+        const conn = try harness.Conn.open(try instance.boundPort());
+        defer conn.close();
+        try conn.send(harness.get_request);
+        var buf: [64]u8 = undefined;
+        _ = try conn.recv(&buf);
+    }
+
+    instance.stop();
+    try harness.joinWithin(thread, &done, 5_000);
+}
+
+// The loop parks in `kevent` with no deadline when nothing is pending, so
+// stopping has to actively wake it. Without the wake it would sit there
+// until some unrelated event happened to arrive.
+test "stop wakes a loop parked with no work" {
+    const allocator = std.heap.page_allocator;
+
+    const instance = try allocator.create(loom.Loom(EchoHandler));
+    defer allocator.destroy(instance);
+    // Timeouts off, no connections: nothing will wake this loop on its own.
+    try instance.new(.{
+        .max = 8,
+        .server_addr = "127.0.0.1",
+        .server_port = 0,
+        .idle_timeout_ms = 0,
+    }, allocator, .{});
+    defer instance.deinit();
+    try instance.bindListener();
+
+    const Runner = struct {
+        fn run(srv: *loom.Loom(EchoHandler), done: *std.atomic.Value(bool)) void {
+            srv.serve() catch {};
+            done.store(true, .release);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{ instance, &done });
+
+    harness.sleepMs(100); // let it reach the blocking wait
+    instance.stop();
+    try harness.joinWithin(thread, &done, 5_000);
+}
+
+// Shutting down with connections still open has to release them too --
+// otherwise a stopped server still holds its descriptors.
+test "stop tears down live connections" {
+    const allocator = std.heap.page_allocator;
+    const max = 8;
+
+    var server = try harness.Server(EchoHandler).start(allocator, .{}, .{ .max = max });
+
+    const conns = try server.connectMany(allocator, max);
+    defer allocator.free(conns);
+    defer for (conns) |c| c.close();
+
+    var buf: [64]u8 = undefined;
+    for (conns) |c| {
+        try c.send(harness.get_request);
+        _ = try c.recv(&buf);
+    }
+
+    // Joins the loop and runs deinit; must not hang or crash with every
+    // slot still occupied.
+    server.stop();
+
+    // The server is gone, so its peers see the connections end.
+    for (conns) |c| try testing.expect(try c.waitForClose(2_000));
+}
+
+// With a real shutdown path, the whole server lifecycle can be leak
+// checked -- not just `new`/`deinit`, but accepting, serving, timing
+// connections out and tearing down under load.
+test "a full server lifecycle under load leaks nothing" {
+    var debug_allocator = std.heap.DebugAllocator(.{}){};
+    const allocator = debug_allocator.allocator();
+
+    {
+        var server = try harness.Server(EchoHandler).start(allocator, .{}, .{
+            .max = 8,
+            .idle_timeout_ms = 150,
+        });
+        defer server.stop();
+
+        var buf: [64]u8 = undefined;
+
+        // Served-and-closed connections.
+        for (0..40) |_| {
+            const conn = try server.connect();
+            defer conn.close();
+            try conn.send(harness.get_request);
+            _ = try conn.recv(&buf);
+        }
+
+        // Connections left to expire.
+        const idle = try server.connectMany(allocator, 4);
+        defer allocator.free(idle);
+        defer for (idle) |c| c.close();
+        for (idle) |c| try testing.expect(try c.waitForClose(2_000));
+
+        // And some still open at shutdown.
+        const live = try server.connectMany(allocator, 4);
+        defer allocator.free(live);
+        defer for (live) |c| c.close();
+        for (live) |c| try c.send(harness.get_request);
+        for (live) |c| _ = try c.recv(&buf);
+    }
+
+    try testing.expectEqual(std.heap.Check.ok, debug_allocator.deinit());
+}
+
+// ── Per-connection read buffers ────────────────────────────────────
+
+/// Holds on to the first connection's `msg` slice and re-checks it every
+/// time a later connection is served.
+///
+/// Every connection used to read into one process-global buffer, so a
+/// slice handed to the handler stayed valid only until the next read on
+/// *any* connection — one client's request could be overwritten by
+/// another's mid-flight. With per-connection buffers the slice is only
+/// disturbed by the connection that owns it.
+const IsolationHandler = struct {
+    var held: ?[]const u8 = null;
+    var expected: [256]u8 = undefined;
+    var expected_len: usize = 0;
+    var checks = std.atomic.Value(u32).init(0);
+    var corrupted = std.atomic.Value(u32).init(0);
+
+    pub fn process(_: IsolationHandler, client: *loom.Client, msg: []const u8) !void {
+        if (held) |slice| {
+            // A later connection. The first one's bytes must be untouched.
+            _ = checks.fetchAdd(1, .monotonic);
+            if (!std.mem.eql(u8, slice, expected[0..expected_len])) {
+                _ = corrupted.fetchAdd(1, .monotonic);
+            }
+        } else if (msg.len <= expected.len) {
+            // The first connection. Remember both the slice and a private
+            // copy of what it should say.
+            @memcpy(expected[0..msg.len], msg);
+            expected_len = msg.len;
+            held = msg;
+        }
+        try client.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    }
+
+    fn reset() void {
+        held = null;
+        expected_len = 0;
+        checks.store(0, .monotonic);
+        corrupted.store(0, .monotonic);
+    }
+};
+
+test "regression: one connection's data is not disturbed by another's" {
+    const allocator = std.heap.page_allocator;
+    IsolationHandler.reset();
+
+    var server = try harness.Server(IsolationHandler).start(allocator, .{}, .{ .max = 16 });
+    defer server.stop();
+
+    // The first connection stays open for the whole test, so the slice
+    // the handler is holding stays owned by a live client.
+    const first = try server.connect();
+    defer first.close();
+
+    var buf: [64]u8 = undefined;
+    try first.send("GET /aaaaaaaaaaaaaaaa HTTP/1.1\r\nHost: first\r\n\r\n");
+    _ = try first.recv(&buf);
+
+    // Now drive traffic through other connections, each sending a
+    // different payload of a similar size. Under a shared buffer these
+    // land on top of the bytes the handler is still holding.
+    for (0..20) |_| {
+        const other = try server.connect();
+        defer other.close();
+        try other.send("GET /bbbbbbbbbbbbbbbb HTTP/1.1\r\nHost: other\r\n\r\n");
+        _ = try other.recv(&buf);
+    }
+
+    try testing.expect(IsolationHandler.checks.load(.monotonic) >= 20);
+    try testing.expectEqual(@as(u32, 0), IsolationHandler.corrupted.load(.monotonic));
+}
+
+/// Records the largest single `msg` it is handed.
+const GrowthHandler = struct {
+    var largest = std.atomic.Value(usize).init(0);
+    var total = std.atomic.Value(usize).init(0);
+
+    pub fn process(_: GrowthHandler, _: *loom.Client, msg: []const u8) !void {
+        _ = total.fetchAdd(msg.len, .monotonic);
+        var seen = largest.load(.monotonic);
+        while (msg.len > seen) {
+            seen = largest.cmpxchgWeak(seen, msg.len, .monotonic, .monotonic) orelse break;
+        }
+    }
+
+    fn reset() void {
+        largest.store(0, .monotonic);
+        total.store(0, .monotonic);
+    }
+};
+
+test "read buffers grow for connections that need them" {
+    const allocator = std.heap.page_allocator;
+    GrowthHandler.reset();
+
+    const initial = 1024;
+    var server = try harness.Server(GrowthHandler).start(allocator, .{}, .{
+        .max = 8,
+        .initial_read_size = initial,
+        .max_read_size = 64 * 1024,
+    });
+    defer server.stop();
+
+    const conn = try server.connect();
+    defer conn.close();
+
+    // Push far more than the initial buffer holds, in one continuous
+    // stream, so reads come back full and the buffer is asked to grow.
+    const payload = try allocator.alloc(u8, 512 * 1024);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+    try conn.send(payload);
+
+    // Wait until everything has been consumed.
+    var waited: usize = 0;
+    while (GrowthHandler.total.load(.monotonic) < payload.len and waited < 200) : (waited += 1) {
+        harness.sleepMs(10);
+    }
+
+    try testing.expectEqual(payload.len, GrowthHandler.total.load(.monotonic));
+    // A buffer that never grew could not have delivered more than
+    // `initial` bytes in a single call.
+    try testing.expect(GrowthHandler.largest.load(.monotonic) > initial);
+}
+
+test "read buffers stay within the configured ceiling" {
+    const allocator = std.heap.page_allocator;
+    GrowthHandler.reset();
+
+    const cap = 8 * 1024;
+    var server = try harness.Server(GrowthHandler).start(allocator, .{}, .{
+        .max = 8,
+        .initial_read_size = 1024,
+        .max_read_size = cap,
+    });
+    defer server.stop();
+
+    const conn = try server.connect();
+    defer conn.close();
+
+    const payload = try allocator.alloc(u8, 256 * 1024);
+    defer allocator.free(payload);
+    @memset(payload, 'y');
+    try conn.send(payload);
+
+    var waited: usize = 0;
+    while (GrowthHandler.total.load(.monotonic) < payload.len and waited < 200) : (waited += 1) {
+        harness.sleepMs(10);
+    }
+
+    try testing.expectEqual(payload.len, GrowthHandler.total.load(.monotonic));
+    try testing.expect(GrowthHandler.largest.load(.monotonic) <= cap);
+}
+
+// Per-connection buffers only pay off if they are sized on demand. If a
+// server allocated `max` * `max_read_size` up front, the defaults would
+// cost half a gigabyte before serving a single request.
+test "a fresh server does not preallocate the worst-case read memory" {
+    var counting = harness.CountingAllocator.init(std.heap.page_allocator);
+    const allocator = counting.allocator();
+
+    var instance: loom.Loom(EchoHandler) = undefined;
+    try instance.new(.{
+        .max = 256,
+        .server_addr = "127.0.0.1",
+        .server_port = 0,
+        .max_read_size = 2 * 1024 * 1024,
+    }, allocator, .{});
+    defer instance.deinit();
+
+    // max * max_read_size would be 512 MiB; a few MiB of bookkeeping is fine.
+    try testing.expect(counting.outstanding() < 8 * 1024 * 1024);
+}
+
+test "rejects a read-buffer ceiling below the starting size" {
+    const allocator = std.heap.page_allocator;
+
+    var instance: loom.Loom(EchoHandler) = undefined;
+    try testing.expectError(error.InvalidConfig, instance.new(.{
+        .initial_read_size = 64 * 1024,
+        .max_read_size = 1024,
+    }, allocator, .{}));
+
+    try testing.expectError(error.InvalidConfig, instance.new(.{
+        .initial_read_size = 0,
+    }, allocator, .{}));
 }

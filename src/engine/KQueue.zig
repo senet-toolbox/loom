@@ -56,9 +56,48 @@ fn rawKqueue() !c_int {
 
 // ── Public API (mostly unchanged) ──────────────────────────────────
 
+/// Identifier of the user event used to break the loop out of `kevent`.
+///
+/// Idents are namespaced per filter, so this cannot collide with a socket
+/// descriptor registered under `EVFILT.READ` or `EVFILT.WRITE`.
+pub const wake_ident: usize = 0;
+
 pub fn init() !KQueue {
     const kfd = try rawKqueue();
     return .{ .kfd = kfd };
+}
+
+/// Register the user event that `wake` triggers. Call once, before
+/// entering the loop.
+pub fn registerWake(self: *KQueue) !void {
+    try self.queueChange(.{
+        .ident = wake_ident,
+        .filter = system.EVFILT.USER,
+        .flags = system.EV.ADD | system.EV.CLEAR,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    });
+}
+
+/// Wake a loop parked in `kevent`, from any thread.
+///
+/// Applies the trigger with its own `kevent` call rather than going
+/// through `queueChange`: the pending-change list belongs to the loop
+/// thread and is not synchronised, but the `kevent` syscall itself is
+/// safe to issue concurrently on the same kqueue.
+pub fn wake(self: *KQueue) void {
+    const trigger = [_]system.Kevent{.{
+        .ident = wake_ident,
+        .filter = system.EVFILT.USER,
+        .flags = 0,
+        .fflags = std.c.NOTE.TRIGGER,
+        .data = 0,
+        .udata = 0,
+    }};
+    // Nothing useful to do if this fails; the loop still exits on its
+    // next natural wakeup because the running flag is already cleared.
+    _ = rawKevent(self.kfd, &trigger, &.{}, null) catch {};
 }
 
 pub fn deinit(self: KQueue) void {

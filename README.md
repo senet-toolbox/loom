@@ -59,7 +59,8 @@ curl -i http://127.0.0.1:8080/
 | `server_port` | `8080` | Port to bind. `0` lets the kernel choose; read it back with `boundPort()`. |
 | `max` | `256` | Maximum concurrent connections. The listener parks when full and re-arms as slots free. |
 | `max_body_size` | `4 MiB` | Largest response body accepted by `write`. |
-| `max_read_size` | `2 MiB` | Size of the shared read buffer. |
+| `initial_read_size` | `16 KiB` | Size of a connection's read buffer at accept. |
+| `max_read_size` | `2 MiB` | Ceiling a connection's read buffer may grow to. |
 | `idle_timeout_ms` | `60_000` | Drop connections that make no progress for this long. `0` disables. |
 
 ## API
@@ -68,8 +69,11 @@ curl -i http://127.0.0.1:8080/
 - `bindListener()` — bind and arm the listener without serving, so the
   port is known before the loop starts.
 - `boundPort()` — the port actually bound.
-- `serve()` — run the event loop. Does not return.
+- `serve()` — run the event loop until `stop()` is called.
 - `listen()` — `bindListener` then `serve`.
+- `stop()` — ask the loop to finish. Safe from another thread or a signal
+  handler while the loop is parked; `serve()` returns once the in-flight
+  batch is done.
 - `deinit()` — close live connections, the listener, and release everything.
 
 On a `*Client`:
@@ -80,10 +84,9 @@ On a `*Client`:
   and body into one syscall.
 - `sendFile(file)` — stream a file; ownership transfers to the client.
 - `isWriting()` — true while a previous send is still draining.
-- `fiber_index` — dense connection slot in `0..max`, stable for the
-  connection's lifetime. Useful as a key for your own per-connection
-  state. (Named for a fiber pool that no longer exists; due for a rename
-  to `slot`.)
+- `slot` — dense connection index in `0..max`, stable for the
+  connection's lifetime and never shared with another live connection.
+  Useful as a key for your own per-connection state.
 
 ## Behaviour worth knowing
 
@@ -92,10 +95,12 @@ request split across packets arrives as two calls; two pipelined requests
 in one packet arrive as one. Accumulating bytes until a complete message
 has arrived is the caller's job.
 
-**The read buffer is shared.** Every connection reads into one
-process-global buffer sized by `max_read_size`. The slice handed to
-`process` is only valid until the next read on any connection — copy
-anything you need to keep.
+**Read buffers are per-connection.** The slice handed to `process` stays
+valid until the next read *on that connection*; nothing another
+connection does can disturb it. Each buffer starts at
+`initial_read_size` and doubles up to `max_read_size` when a read comes
+back full, so only connections that actually send a lot pay for a large
+buffer.
 
 **Write payloads are borrowed.** A payload too large for the 64 KiB writer
 buffer is held as a slice until it drains. Keep the backing memory alive
@@ -128,7 +133,6 @@ Pre-1.0. Known gaps:
 - Single-threaded. `SO_REUSEPORT` is set on the listener, so running one
   instance per thread or process is the intended way to scale for now,
   but Loom does not do that for you.
-- No graceful shutdown — `serve()` runs until it fails.
 
 ## License
 

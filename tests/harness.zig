@@ -30,6 +30,26 @@ pub fn sleepMs(ms: u64) void {
     _ = system.nanosleep(&req, null);
 }
 
+/// Wait for a thread to signal completion, then join it.
+///
+/// Returns `error.ShutdownTimedOut` rather than blocking forever if it
+/// never does — a loop that ignores `stop` should fail the test, not hang
+/// the suite. The stuck thread is detached on that path so the process
+/// can still exit and report.
+pub fn joinWithin(thread: std.Thread, done: *std.atomic.Value(bool), timeout_ms: u64) !void {
+    const step_ms = 5;
+    var waited: u64 = 0;
+    while (waited < timeout_ms) : (waited += step_ms) {
+        if (done.load(.acquire)) {
+            thread.join();
+            return;
+        }
+        sleepMs(step_ms);
+    }
+    thread.detach();
+    return error.ShutdownTimedOut;
+}
+
 // ── Allocation tracking ────────────────────────────────────────────
 
 /// Wraps an allocator and tracks how many bytes are outstanding.
@@ -114,6 +134,7 @@ pub fn Server(comptime Handler: type) type {
         thread: std.Thread,
         port: u16,
         allocator: std.mem.Allocator,
+        done: *std.atomic.Value(bool),
 
         const Self = @This();
 
@@ -136,20 +157,26 @@ pub fn Server(comptime Handler: type) type {
             try instance.bindListener();
             const port = try instance.boundPort();
 
-            const thread = try std.Thread.spawn(.{}, runLoop, .{instance});
+            const done = try allocator.create(std.atomic.Value(bool));
+            errdefer allocator.destroy(done);
+            done.* = .init(false);
+
+            const thread = try std.Thread.spawn(.{}, runLoop, .{ instance, done });
 
             return .{
                 .loom = instance,
                 .thread = thread,
                 .port = port,
                 .allocator = allocator,
+                .done = done,
             };
         }
 
-        fn runLoop(instance: *loom.Loom(Handler)) void {
+        fn runLoop(instance: *loom.Loom(Handler), done: *std.atomic.Value(bool)) void {
             instance.serve() catch |err| {
                 std.debug.print("server loop exited: {any}\n", .{err});
             };
+            done.store(true, .release);
         }
 
         pub fn connect(self: Self) !Conn {
@@ -169,11 +196,23 @@ pub fn Server(comptime Handler: type) type {
             return conns;
         }
 
-        /// Loom's event loop has no shutdown path yet, so the thread is
-        /// detached and outlives the test. It is parked in `kevent` and
-        /// holds only its own listener, which the OS reclaims at exit.
+        /// Shut the server down and release everything it owns.
+        ///
+        /// Joins the loop thread, so once this returns the server is
+        /// genuinely gone — which is what lets tests assert on leaks
+        /// across a whole server lifecycle rather than just across
+        /// `new`/`deinit`.
         pub fn stop(self: *Self) void {
-            self.thread.detach();
+            self.loom.stop();
+            // Panic rather than block forever: a loop that ignores `stop`
+            // is a bug this suite exists to surface, and a hung run
+            // reports nothing at all.
+            joinWithin(self.thread, self.done, 5_000) catch {
+                @panic("server loop did not stop within 5s");
+            };
+            self.loom.deinit();
+            self.allocator.destroy(self.loom);
+            self.allocator.destroy(self.done);
         }
     };
 }

@@ -178,6 +178,11 @@ pub fn Loom(comptime Handler: type) type {
         // Max connections
         max: usize = undefined,
 
+        // Cleared by `stop` to break the event loop. Atomic because
+        // `stop` is meant to be callable from another thread (or a signal
+        // handler) while the loop is parked in `kevent`.
+        running: std.atomic.Value(bool) = .init(true),
+
         listener: posix.socket_t = -1,
         // Whether the listener is currently armed in the kqueue. Parked
         // when we hit `max` (or run out of file descriptors) and re-armed
@@ -204,7 +209,7 @@ pub fn Loom(comptime Handler: type) type {
 
         // Free connection slots, popped on accept and pushed back on
         // close. Doubles as the connection limiter.
-        free_fiber_indices: std.array_list.Managed(usize) = undefined,
+        free_slots: std.array_list.Managed(usize) = undefined,
 
         // Clients marked for teardown during the current event batch.
         // Draining is deferred to the end of the batch so that a client
@@ -218,6 +223,14 @@ pub fn Loom(comptime Handler: type) type {
             sticky_server: bool = false,
             max: usize = 256,
             max_body_size: usize = 4 * 1024 * 1024,
+
+            /// Size of a connection's read buffer at accept time. Kept
+            /// small because every connection gets its own -- the buffer
+            /// grows on demand for the connections that actually need it,
+            /// rather than every slot paying for the worst case up front.
+            initial_read_size: usize = 16 * 1024,
+
+            /// Ceiling a connection's read buffer may grow to.
             max_read_size: usize = 2097152,
 
             /// Drop a connection that goes this long without making
@@ -233,9 +246,14 @@ pub fn Loom(comptime Handler: type) type {
 
         pub fn new(target: *Loom(Handler), config: Config, arena: Allocator, handler: Handler) !void {
             if (config.max == 0) return error.InvalidConfig;
+            if (config.initial_read_size == 0) return error.InvalidConfig;
+            if (config.max_read_size < config.initial_read_size) return error.InvalidConfig;
 
             var kqueue = try KQueue.init();
             errdefer kqueue.deinit();
+
+            // Queued now, flushed when the listener is armed.
+            try kqueue.registerWake();
 
             // Connection slots, handed out on accept. Popped from the end.
             var free_list = std.array_list.Managed(usize).init(arena);
@@ -251,9 +269,6 @@ pub fn Loom(comptime Handler: type) type {
             errdefer close_queue.deinit();
             try close_queue.ensureTotalCapacity(config.max);
 
-            const reader_buf = try arena.alloc(u8, config.max_read_size);
-            errdefer arena.free(reader_buf);
-
             logger.init();
             target.* = Loom(Handler){
                 .config = config,
@@ -264,14 +279,13 @@ pub fn Loom(comptime Handler: type) type {
                 .client_pool = Abstractions.ManagedMemoryPool(Client).init(arena),
                 .idle_timeout_ms = config.idle_timeout_ms,
                 .kqueue = kqueue,
+                .running = .init(true),
                 .threaded = .init_single_threaded,
                 .max_body_size = config.max_body_size,
-                .free_fiber_indices = free_list,
+                .free_slots = free_list,
                 .close_queue = close_queue,
                 .handler = handler,
             };
-
-            Client.reader_buf = reader_buf;
         }
 
         /// The `std.Io` for this server.
@@ -305,12 +319,8 @@ pub fn Loom(comptime Handler: type) type {
             }
             self.kqueue.deinit();
             self.client_pool.deinit();
-            self.free_fiber_indices.deinit();
+            self.free_slots.deinit();
             self.close_queue.deinit();
-            if (Client.reader_buf.len != 0) {
-                self.arena.free(Client.reader_buf);
-                Client.reader_buf = &.{};
-            }
             self.threaded.deinit();
         }
 
@@ -329,7 +339,7 @@ pub fn Loom(comptime Handler: type) type {
         /// Idempotent.
         fn armListener(self: *Loom(Handler)) void {
             if (self.listener_armed or self.listener < 0) return;
-            if (self.free_fiber_indices.items.len == 0) return;
+            if (self.free_slots.items.len == 0) return;
             self.kqueue.enableListener(self.listener) catch |err| {
                 log.err("failed to re-arm listener: {any}", .{err});
                 return;
@@ -535,11 +545,26 @@ pub fn Loom(comptime Handler: type) type {
             }
         }
 
-        /// Bind if needed, then run the event loop. Does not return until
-        /// the loop fails.
+        /// Bind if needed, then run the event loop until `stop` is called
+        /// or the loop fails.
         pub fn serve(loom: *Loom(Handler)) !void {
             try loom.bindListener();
             try run(loom);
+        }
+
+        /// Ask the event loop to finish.
+        ///
+        /// Safe to call from another thread while the loop is parked in
+        /// `kevent`: the flag is atomic and the wake goes through its own
+        /// syscall rather than the loop's pending-change list. `serve`
+        /// returns once the in-flight batch is done; connections are torn
+        /// down by `deinit`, not here.
+        ///
+        /// Idempotent, and safe to call before the loop has started — the
+        /// loop then exits at its first check.
+        pub fn stop(loom: *Loom(Handler)) void {
+            loom.running.store(false, .release);
+            loom.kqueue.wake();
         }
 
         /// This function calls listen on the Loom instance.
@@ -548,7 +573,7 @@ pub fn Loom(comptime Handler: type) type {
         }
 
         fn run(loom: *Loom(Handler)) !void {
-            while (true) {
+            while (loom.running.load(.acquire)) {
                 // Reap anything past its deadline, then block only until
                 // the next deadline is due.
                 const next_timeout = loom.enforceTimeout();
@@ -561,6 +586,11 @@ pub fn Loom(comptime Handler: type) type {
                 };
 
                 for (ready_events) |ready| {
+                    // The wake event carries no udata, so it has to be
+                    // recognised by filter before the udata dispatch
+                    // below would mistake it for the listener.
+                    if (ready.filter == system.EVFILT.USER) continue;
+
                     const nptr = ready.udata;
 
                     switch (nptr) {
@@ -892,7 +922,7 @@ pub fn Loom(comptime Handler: type) type {
             var address: net.IpAddress = undefined;
             var address_len: posix.socklen_t = @sizeOf(net.IpAddress);
 
-            if (self.free_fiber_indices.items.len == 0 or self.connected >= self.max) {
+            if (self.free_slots.items.len == 0 or self.connected >= self.max) {
                 // Out of slots. Park the listener; `drainCloseQueue` re-arms
                 // it as soon as a connection closes.
                 self.disarmListener();
@@ -906,7 +936,15 @@ pub fn Loom(comptime Handler: type) type {
             const client: *Client = try self.client_pool.create();
             errdefer self.client_pool.destroy(client);
 
-            client.* = Client.init(self.arena, self.io(), socket, address, &self.kqueue) catch |err| {
+            client.* = Client.init(
+                self.arena,
+                self.io(),
+                socket,
+                address,
+                &self.kqueue,
+                self.config.initial_read_size,
+                self.config.max_read_size,
+            ) catch |err| {
                 log.err("failed to initialize client: {}", .{err});
                 return err;
             };
@@ -918,8 +956,8 @@ pub fn Loom(comptime Handler: type) type {
             client.closing = false;
 
             // Claim a connection slot. Checked non-empty above.
-            client.fiber_index = self.free_fiber_indices.pop().?;
-            errdefer self.free_fiber_indices.appendAssumeCapacity(client.fiber_index);
+            client.slot = self.free_slots.pop().?;
+            errdefer self.free_slots.appendAssumeCapacity(client.slot);
 
             try self.kqueue.newClient(client);
             self.connected += 1;
@@ -968,8 +1006,8 @@ pub fn Loom(comptime Handler: type) type {
                 client.pending = null;
 
                 // Return the connection slot.
-                std.debug.assert(client.fiber_index < self.max);
-                self.free_fiber_indices.appendAssumeCapacity(client.fiber_index);
+                std.debug.assert(client.slot < self.max);
+                self.free_slots.appendAssumeCapacity(client.slot);
 
                 self.read_timeout_list.remove(&client.timeout_node);
                 client.deinit(self.arena);

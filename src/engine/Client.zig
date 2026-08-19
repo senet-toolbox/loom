@@ -36,14 +36,13 @@ kqueue: *KQueue,
 socket: posix.socket_t,
 address: std.Io.net.IpAddress,
 
-/// Dense connection-slot index in `0..config.max`, handed out by the
-/// server on accept and returned to the free list on close. Stable for
-/// the lifetime of the connection, so downstream layers can use it to
-/// key their own per-connection state.
+/// Dense connection index in `0..config.max`, handed out by the server on
+/// accept and returned to the free list on close.
 ///
-/// Named for the fiber pool it used to index; kept for API
-/// compatibility and due for a rename to `slot`.
-fiber_index: usize = 0,
+/// Stable for the lifetime of the connection and never shared with
+/// another live connection, so downstream layers can use it to key their
+/// own per-connection state without any bookkeeping of their own.
+slot: usize = 0,
 
 /// Set the moment the server decides this connection is done. The
 /// client stays allocated until the end of the current event batch, so
@@ -74,6 +73,21 @@ client_type: ConnectionType = .HTTP,
 state: State = .Open,
 ws: ?*Websocket = null,
 io: std.Io = undefined,
+
+/// This connection's own read buffer.
+///
+/// Starts at `Config.initial_read_size` and doubles, up to
+/// `Config.max_read_size`, whenever a read comes back completely full —
+/// which is the signal that the peer had more queued than would fit.
+/// Growing is deferred to the start of the next read so that the slice
+/// handed to the handler is never reallocated out from under it.
+read_buf: []u8 = &.{},
+max_read_size: usize = 0,
+grow_read_buf: bool = false,
+
+/// Allocator that owns `read_buf`. Held so the buffer can grow without
+/// the read path having to reach back into the server.
+arena: Allocator = undefined,
 // Overflow tail of an in-flight slice send. While non-null, the
 // client is mid-async-send and refuses new writes.
 pending: ?[]const u8 = null,
@@ -83,15 +97,20 @@ pending: ?[]const u8 = null,
 // sequence sends in the right order).
 pending_file: ?std.Io.File = null,
 
-pub fn init(arena: Allocator, io: std.Io, socket: posix.socket_t, address: std.Io.net.IpAddress, kqueue: *KQueue) !Client {
-    // const reader = try Reader.init(arena, 4096);
-    // errdefer reader.deinit(arena);
-
+pub fn init(
+    arena: Allocator,
+    io: std.Io,
+    socket: posix.socket_t,
+    address: std.Io.net.IpAddress,
+    kqueue: *KQueue,
+    initial_read_size: usize,
+    max_read_size: usize,
+) !Client {
     const writer = try Writer.init(arena, 4096);
     errdefer writer.deinit(arena);
 
-    // const write_buf = try arena.alloc(u8, 4096);
-    // errdefer arena.free(write_buf);
+    const read_buf = try arena.alloc(u8, initial_read_size);
+    errdefer arena.free(read_buf);
 
     return .{
         .kqueue = kqueue,
@@ -102,11 +121,17 @@ pub fn init(arena: Allocator, io: std.Io, socket: posix.socket_t, address: std.I
         .response = "",
         .read_timeout = 0, // let the server set this
         .io = io,
+        .read_buf = read_buf,
+        .max_read_size = max_read_size,
+        .arena = arena,
     };
 }
 
-pub fn deinit(_: *const Client, _: Allocator) void {
-    // self.writer.deinit(arena);
+pub fn deinit(self: *Client, arena: Allocator) void {
+    if (self.read_buf.len != 0) {
+        arena.free(self.read_buf);
+        self.read_buf = &.{};
+    }
 }
 
 fn findEndOfHeaders(buffer: []const u8) ?usize {
@@ -185,36 +210,43 @@ pub fn findCRLFCRLF(payload: []const u8) ?usize {
     return null;
 }
 
-/// Scratch buffer every client reads into, sized from
-/// `Config.max_read_size` and owned by the server.
+/// Read whatever has arrived, into this connection's own buffer.
 ///
-/// NOTE: process-global and therefore shared by every connection. The
-/// slice handed to the handler stays valid only until the next read on
-/// any client — see the lifetime note on `write`.
-pub var reader_buf: []u8 = &.{};
+/// The returned slice stays valid until the next read *on this
+/// connection*. Nothing another connection does can disturb it.
 pub fn readMessage(self: *Client) ![]const u8 {
-    // return self.reader.readMessage(self.socket) catch |err| {
-    //     // try Loom.logger.err("Read msg {any}", .{err}, @src());
-    //     switch (err) {
-    //         error.WouldBlock => return null,
-    //         else => return err,
-    //     }
-    // };
+    // Deferred from the previous read: growing here, before the read,
+    // means the slice handed out last time was never invalidated.
+    if (self.grow_read_buf) {
+        self.grow_read_buf = false;
+        self.growReadBuf();
+    }
 
-    const rv = try posix.read(self.socket, reader_buf);
+    const rv = try posix.read(self.socket, self.read_buf);
     if (rv == 0) {
         return error.Closed;
     }
 
-    // var end = buf[0..rv].len;
-    // std.debug.print("{s}\n", .{buf[0..rv]});
-    // if (buf[end - 1] != 10) {
-    //     // std.debug.print("H\n", .{});
-    //     end = findCRLFCRLF(buf[0..rv]).?;
-    //     // std.debug.print("{any}\n", .{end});
-    // }
+    // A read that filled the buffer exactly almost always means the peer
+    // had more waiting. Take the hint and read bigger next time.
+    if (rv == self.read_buf.len and self.read_buf.len < self.max_read_size) {
+        self.grow_read_buf = true;
+    }
 
-    return reader_buf[0..rv];
+    return self.read_buf[0..rv];
+}
+
+/// Double the read buffer, capped at `max_read_size`.
+///
+/// Best-effort: if the allocation fails the connection keeps its current
+/// buffer and simply reads in smaller pieces, which is slower but
+/// correct. Failing to grow is not a reason to drop a live connection.
+fn growReadBuf(self: *Client) void {
+    const target = @min(self.read_buf.len *| 2, self.max_read_size);
+    if (target <= self.read_buf.len) return;
+    if (self.arena.realloc(self.read_buf, target)) |bigger| {
+        self.read_buf = bigger;
+    } else |_| {}
 }
 
 /// True while a previous send is still draining — either there's
