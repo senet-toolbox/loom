@@ -11,7 +11,8 @@ const Scheduler = @import("async/Scheduler.zig");
 pub const xresume = Scheduler.xresume;
 pub const xsuspend = Scheduler.xsuspend;
 const Client = @import("Client.zig");
-const KQueue = @import("KQueue.zig");
+const Poller = @import("Poller.zig").Backend;
+const PollEvent = @import("Poller.zig").Event;
 const Abstractions = @import("Abstractions.zig");
 const errno = posix.system.errno;
 const Time = @import("Time.zig");
@@ -190,7 +191,7 @@ pub fn Loom(comptime Handler: type) type {
         listener_armed: bool = false,
 
         // Event Loop
-        kqueue: KQueue = undefined,
+        poller: Poller = undefined,
         threaded: std.Io.Threaded = .init_single_threaded,
 
         // The number of clients we currently have connected
@@ -208,14 +209,45 @@ pub fn Loom(comptime Handler: type) type {
         max_body_size: usize,
 
         // Free connection slots, popped on accept and pushed back on
-        // close. Doubles as the connection limiter.
+        // close. Doubles as the connection limiter. Holds indices in
+        // `slot_base .. slot_base + max`.
         free_slots: std.array_list.Managed(usize) = undefined,
+        slot_base: usize = 0,
+
+        // False when the listener belongs to someone else (a `Cluster`
+        // sharing one socket across workers), in which case this instance
+        // must not close it.
+        owns_listener: bool = true,
+
+        stats: Stats = .{},
 
         // Clients marked for teardown during the current event batch.
         // Draining is deferred to the end of the batch so that a client
         // is never freed while later events in the same batch still
         // reference it.
         close_queue: std.array_list.Managed(*Client) = undefined,
+
+        /// Cheap per-worker counters.
+        ///
+        /// Plain integers, not atomics: a `Loom` is only ever touched by
+        /// its own thread, so incrementing costs nothing. Reading them
+        /// from another thread is racy in the harmless way — you may see
+        /// a slightly stale count, never a torn one on any target we
+        /// support.
+        pub const Stats = struct {
+            /// Times the loop was woken by the listener being readable.
+            listener_wakeups: u64 = 0,
+            /// Wakeups that yielded no connection at all, because another
+            /// worker won the race. This is the cost of sharing one
+            /// listener between workers.
+            empty_listener_wakeups: u64 = 0,
+            /// Connections accepted by this worker.
+            accepted: u64 = 0,
+            /// Connections refused because every slot was taken.
+            rejected_at_capacity: u64 = 0,
+            /// Connections dropped for making no progress in time.
+            timed_out: u64 = 0,
+        };
 
         pub const Config = struct {
             server_addr: []const u8 = "0.0.0.0",
@@ -233,6 +265,15 @@ pub fn Loom(comptime Handler: type) type {
             /// Ceiling a connection's read buffer may grow to.
             max_read_size: usize = 2097152,
 
+            /// First connection slot index this instance hands out.
+            ///
+            /// Only interesting under `Cluster`, which gives each worker a
+            /// disjoint range so that a slot identifies a connection
+            /// uniquely across the whole server, not just within one
+            /// worker. Downstream code keying per-connection state by
+            /// slot then needs no knowledge of workers at all.
+            slot_base: usize = 0,
+
             /// Drop a connection that goes this long without making
             /// progress — no bytes read, and no bytes of a pending
             /// response accepted by the kernel. Set to 0 to disable.
@@ -249,18 +290,18 @@ pub fn Loom(comptime Handler: type) type {
             if (config.initial_read_size == 0) return error.InvalidConfig;
             if (config.max_read_size < config.initial_read_size) return error.InvalidConfig;
 
-            var kqueue = try KQueue.init();
-            errdefer kqueue.deinit();
+            var poller = try Poller.init();
+            errdefer poller.deinit();
 
             // Queued now, flushed when the listener is armed.
-            try kqueue.registerWake();
+            try poller.registerWake();
 
             // Connection slots, handed out on accept. Popped from the end.
             var free_list = std.array_list.Managed(usize).init(arena);
             errdefer free_list.deinit();
             try free_list.ensureTotalCapacity(config.max);
             for (0..config.max) |i| {
-                free_list.appendAssumeCapacity(i);
+                free_list.appendAssumeCapacity(config.slot_base + i);
             }
 
             // Capacity is `max` and a client can only be queued once (the
@@ -278,7 +319,8 @@ pub fn Loom(comptime Handler: type) type {
                 .read_timeout_list = .{},
                 .client_pool = Abstractions.ManagedMemoryPool(Client).init(arena),
                 .idle_timeout_ms = config.idle_timeout_ms,
-                .kqueue = kqueue,
+                .slot_base = config.slot_base,
+                .poller = poller,
                 .running = .init(true),
                 .threaded = .init_single_threaded,
                 .max_body_size = config.max_body_size,
@@ -313,11 +355,11 @@ pub fn Loom(comptime Handler: type) type {
             self.drainCloseQueue();
 
             if (self.listener >= 0) {
-                close(self.listener);
+                if (self.owns_listener) close(self.listener);
                 self.listener = -1;
                 self.listener_armed = false;
             }
-            self.kqueue.deinit();
+            self.poller.deinit();
             self.client_pool.deinit();
             self.free_slots.deinit();
             self.close_queue.deinit();
@@ -328,7 +370,7 @@ pub fn Loom(comptime Handler: type) type {
         /// have no slot for. Idempotent.
         fn disarmListener(self: *Loom(Handler)) void {
             if (!self.listener_armed or self.listener < 0) return;
-            self.kqueue.removeListener(self.listener) catch |err| {
+            self.poller.removeListener(self.listener) catch |err| {
                 log.err("failed to park listener: {any}", .{err});
                 return;
             };
@@ -340,7 +382,7 @@ pub fn Loom(comptime Handler: type) type {
         fn armListener(self: *Loom(Handler)) void {
             if (self.listener_armed or self.listener < 0) return;
             if (self.free_slots.items.len == 0) return;
-            self.kqueue.enableListener(self.listener) catch |err| {
+            self.poller.enableListener(self.listener) catch |err| {
                 log.err("failed to re-arm listener: {any}", .{err});
                 return;
             };
@@ -453,12 +495,12 @@ pub fn Loom(comptime Handler: type) type {
             try connlisten(listener, 4096);
 
             // 4. Add to THIS THREAD'S kqueue (not a shared one)
-            try loom.kqueue.addListener(listener);
+            try loom.poller.addListener(listener);
             loom.listener = listener;
             loom.listener_armed = true;
 
             // 5. Force flush kqueue changes immediately
-            try loom.kqueue.flushChanges();
+            try loom.poller.flushChanges();
 
             return listener;
         }
@@ -532,6 +574,21 @@ pub fn Loom(comptime Handler: type) type {
             };
         }
 
+        /// Use an already-bound listening socket instead of creating one.
+        ///
+        /// The socket stays the caller's property: `deinit` will not close
+        /// it. This is how `Cluster` puts every worker on one listener --
+        /// each registers it in its own kqueue and they race to accept,
+        /// which spreads connections toward whichever workers are idle.
+        pub fn adoptListener(loom: *Loom(Handler), fd: posix.socket_t) !void {
+            if (loom.listener >= 0) return error.AlreadyBound;
+            loom.listener = fd;
+            loom.owns_listener = false;
+            try loom.poller.addListener(fd);
+            loom.listener_armed = true;
+            try loom.poller.flushChanges();
+        }
+
         /// The port the listener actually bound to. Only meaningful after
         /// `bindListener`; the interesting case is `server_port = 0`, where
         /// the kernel picks an ephemeral port.
@@ -564,7 +621,7 @@ pub fn Loom(comptime Handler: type) type {
         /// loop then exits at its first check.
         pub fn stop(loom: *Loom(Handler)) void {
             loom.running.store(false, .release);
-            loom.kqueue.wake();
+            loom.poller.wake();
         }
 
         /// This function calls listen on the Loom instance.
@@ -586,17 +643,15 @@ pub fn Loom(comptime Handler: type) type {
                 };
 
                 for (ready_events) |ready| {
-                    // The wake event carries no udata, so it has to be
-                    // recognised by filter before the udata dispatch
-                    // below would mistake it for the listener.
-                    if (ready.filter == system.EVFILT.USER) continue;
+                    switch (ready.source) {
+                        // Only ever means "re-check the running flag",
+                        // which the enclosing while already does.
+                        .wake => continue,
 
-                    const nptr = ready.udata;
+                        .listener => loom.acceptPending(),
 
-                    switch (nptr) {
-                        0 => loom.acceptPending(),
-                        else => |n| {
-                            const client: *Client = @ptrFromInt(n);
+                        .client => {
+                            const client: *Client = @ptrFromInt(ready.client_ptr);
 
                             // The client was torn down earlier in this same
                             // batch. Its memory is still alive (the close
@@ -604,25 +659,22 @@ pub fn Loom(comptime Handler: type) type {
                             // so the event is stale.
                             if (client.closing) continue;
 
-                            // kevent reports per-event failures inline. The
-                            // filter is dead either way, so drop the client.
-                            if (ready.flags & system.EV.ERROR != 0) {
-                                log.err("kevent error on fd {d}: {d}", .{ client.socket, ready.data });
+                            // The poller reports per-descriptor failures
+                            // inline. It is dead either way, so drop it.
+                            if (ready.failed) {
                                 loom.closeClient(client);
                                 continue;
                             }
 
-                            const filter = ready.filter;
-
-                            // Here we read in the client data
-                            // we check the filter state
-                            if (filter == system.EVFILT.READ) {
+                            // Both may be set at once: epoll reports one
+                            // event per descriptor with every ready
+                            // condition combined, where kqueue reports one
+                            // per filter.
+                            if (ready.readable) {
                                 while (true) {
                                     const msg = client.readMessage() catch |err| {
                                         switch (err) {
-                                            error.WouldBlock => {
-                                                break;
-                                            },
+                                            error.WouldBlock => break,
                                             else => {
                                                 loom.closeClient(client);
                                                 break;
@@ -632,9 +684,7 @@ pub fn Loom(comptime Handler: type) type {
 
                                     loom.touchClient(client);
 
-                                    //////////////////////////////////////////////////////////////////////////////////
                                     loom.handler.process(client, msg) catch {
-                                        // std.debug.print("Handler error: {any}\n", .{err});
                                         loom.closeClient(client);
                                         break;
                                     };
@@ -643,7 +693,9 @@ pub fn Loom(comptime Handler: type) type {
                                     // (directly, or by way of a failed write).
                                     if (client.closing) break;
                                 }
-                            } else if (filter == system.EVFILT.WRITE) {
+                            }
+
+                            if (ready.writable and !client.closing) {
                                 // Drive the write state machine forward. On
                                 // completion this also flips the client back
                                 // to read mode for the next keep-alive request.
@@ -669,6 +721,12 @@ pub fn Loom(comptime Handler: type) type {
         /// Drain the accept backlog. Stops on the first would-block, on a
         /// full connection table, or on a persistent error — never spins.
         fn acceptPending(loom: *Loom(Handler)) void {
+            loom.stats.listener_wakeups += 1;
+            const before = loom.stats.accepted;
+            defer if (loom.stats.accepted == before) {
+                loom.stats.empty_listener_wakeups += 1;
+            };
+
             while (true) {
                 loom.acceptConn() catch |err| switch (err) {
                     // Backlog drained; the listener is level-triggered so
@@ -677,7 +735,10 @@ pub fn Loom(comptime Handler: type) type {
 
                     // No slot free. The listener is parked; it gets re-armed
                     // by `drainCloseQueue` when one frees up.
-                    error.NoCapacity => return,
+                    error.NoCapacity => {
+                        loom.stats.rejected_at_capacity += 1;
+                        return;
+                    },
 
                     // Out of file descriptors. Park the listener rather than
                     // spinning on a failure that won't clear on its own.
@@ -745,6 +806,7 @@ pub fn Loom(comptime Handler: type) type {
                         // client still in the future bounds the wait.
                         return std.math.cast(i32, remaining) orelse std.math.maxInt(i32);
                     }
+                    self.stats.timed_out += 1;
                     self.closeClient(client);
                 }
                 it = next;
@@ -941,9 +1003,10 @@ pub fn Loom(comptime Handler: type) type {
                 self.io(),
                 socket,
                 address,
-                &self.kqueue,
+                &self.poller,
                 self.config.initial_read_size,
                 self.config.max_read_size,
+                self.config.max_body_size,
             ) catch |err| {
                 log.err("failed to initialize client: {}", .{err});
                 return err;
@@ -959,16 +1022,17 @@ pub fn Loom(comptime Handler: type) type {
             client.slot = self.free_slots.pop().?;
             errdefer self.free_slots.appendAssumeCapacity(client.slot);
 
-            try self.kqueue.newClient(client);
+            try self.poller.newClient(client);
             self.connected += 1;
+            self.stats.accepted += 1;
 
             // Newest deadline, so it belongs at the tail.
             client.read_timeout = milliTimestamp() + self.idle_timeout_ms;
             self.read_timeout_list.append(&client.timeout_node);
         }
 
-        pub fn readEvents(loom: *Loom(Handler), next_timeout: i32) ![]system.Kevent {
-            return try loom.kqueue.wait(next_timeout);
+        pub fn readEvents(loom: *Loom(Handler), next_timeout: i32) ![]PollEvent {
+            return try loom.poller.wait(next_timeout);
         }
 
         /// Mark a client for teardown.
@@ -987,7 +1051,7 @@ pub fn Loom(comptime Handler: type) type {
 
             // Any arm/disarm still sitting in the change list would be
             // flushed against a descriptor we are about to close.
-            self.kqueue.purgeChanges(client.socket);
+            self.poller.purgeChanges(client.socket);
 
             // Capacity is `max` and each client enqueues at most once.
             std.debug.assert(self.close_queue.items.len < self.max);
@@ -1006,7 +1070,8 @@ pub fn Loom(comptime Handler: type) type {
                 client.pending = null;
 
                 // Return the connection slot.
-                std.debug.assert(client.slot < self.max);
+                std.debug.assert(client.slot >= self.slot_base);
+                std.debug.assert(client.slot - self.slot_base < self.max);
                 self.free_slots.appendAssumeCapacity(client.slot);
 
                 self.read_timeout_list.remove(&client.timeout_node);

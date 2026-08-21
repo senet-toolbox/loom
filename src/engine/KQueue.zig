@@ -1,21 +1,21 @@
 const std = @import("std");
 const Client = @import("Client.zig");
 const system = std.posix.system;
+const poller = @import("Poller.zig");
+const Event = poller.Event;
 
 pub const KQueue = @This();
 kfd: c_int = undefined,
-event_list: [128]system.Kevent = undefined,
+raw_events: [128]system.Kevent = undefined,
+event_list: [128]Event = undefined,
 change_list: [32]system.Kevent = undefined,
 change_count: usize = 0,
 
 // ── Abstraction layer ──────────────────────────────────────────────
 
-const KQueueError = error{
-    WouldBlock,
-    Interrupted,
-    InvalidSocket,
-    Unexpected,
-};
+/// `rawKevent` reports only what `wait` is allowed to surface, so the
+/// error set lines up with the shared poller contract.
+const KQueueError = poller.WaitError;
 
 /// Wraps the raw kevent syscall, converting c_int returns to Zig errors.
 fn rawKevent(
@@ -115,7 +115,10 @@ fn queueChange(self: *KQueue, event: system.Kevent) !void {
 }
 
 /// Block for events. A negative `timeout_ms` blocks indefinitely.
-pub fn wait(self: *KQueue, timeout_ms: i32) ![]system.Kevent {
+///
+/// Pending registration changes ride along with this call, which is why
+/// kqueue needs no separate syscall per registration.
+pub fn wait(self: *KQueue, timeout_ms: i32) poller.WaitError![]Event {
     const timeout = std.posix.timespec{
         .sec = @intCast(@divTrunc(timeout_ms, 1000)),
         .nsec = @intCast(@mod(timeout_ms, 1000) * 1000000),
@@ -124,10 +127,31 @@ pub fn wait(self: *KQueue, timeout_ms: i32) ![]system.Kevent {
     const count = try rawKevent(
         self.kfd,
         self.change_list[0..self.change_count],
-        &self.event_list,
+        &self.raw_events,
         if (timeout_ms < 0) null else &timeout,
     );
     self.change_count = 0;
+
+    for (self.raw_events[0..count], 0..) |raw, i| {
+        // The user filter is the wakeup; it carries no useful udata, so
+        // it has to be recognised before the udata dispatch.
+        if (raw.filter == system.EVFILT.USER) {
+            self.event_list[i] = .{ .source = .wake };
+            continue;
+        }
+        self.event_list[i] = switch (raw.udata) {
+            poller.tag_listener => .{ .source = .listener },
+            else => .{
+                .source = .client,
+                .client_ptr = raw.udata,
+                // kqueue reports one event per (descriptor, filter), so
+                // exactly one of these is ever set per event.
+                .readable = raw.filter == system.EVFILT.READ,
+                .writable = raw.filter == system.EVFILT.WRITE,
+                .failed = (raw.flags & system.EV.ERROR) != 0,
+            },
+        };
+    }
     return self.event_list[0..count];
 }
 

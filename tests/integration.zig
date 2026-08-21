@@ -145,7 +145,6 @@ test "many concurrent large responses all complete" {
 
 // ── Regressions ────────────────────────────────────────────────────
 
-
 /// Assert the server is still alive and serving.
 ///
 /// Retries, because these stress tests leave the server working through
@@ -1025,4 +1024,472 @@ test "rejects a read-buffer ceiling below the starting size" {
     try testing.expectError(error.InvalidConfig, instance.new(.{
         .initial_read_size = 0,
     }, allocator, .{}));
+}
+
+// ── Cluster ────────────────────────────────────────────────────────
+
+/// Reports which worker served each request, via the connection slot.
+///
+/// Workers are handed disjoint slot ranges, so the slot alone says which
+/// worker owns a connection — no cross-worker bookkeeping needed.
+const ClusterHandler = struct {
+    id: usize,
+
+    var served: [8]std.atomic.Value(u32) = init: {
+        var a: [8]std.atomic.Value(u32) = undefined;
+        for (&a) |*v| v.* = std.atomic.Value(u32).init(0);
+        break :init a;
+    };
+    var slot_seen_by: [512]std.atomic.Value(u32) = init: {
+        @setEvalBranchQuota(4000);
+        var a: [512]std.atomic.Value(u32) = undefined;
+        for (&a) |*v| v.* = std.atomic.Value(u32).init(0);
+        break :init a;
+    };
+    var slot_conflicts = std.atomic.Value(u32).init(0);
+    var work_us: u64 = 0;
+
+    pub fn process(self: ClusterHandler, client: *loom.Client, _: []const u8) !void {
+        _ = served[self.id].fetchAdd(1, .monotonic);
+
+        // Record which worker this slot belongs to. Two workers ever
+        // claiming the same slot means the ranges overlap.
+        if (client.slot < slot_seen_by.len) {
+            const marker: u32 = @intCast(self.id + 1);
+            const prev = slot_seen_by[client.slot].swap(marker, .monotonic);
+            if (prev != 0 and prev != marker) _ = slot_conflicts.fetchAdd(1, .monotonic);
+        }
+
+        if (work_us != 0) harness.sleepMs(work_us / 1000);
+        try client.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    }
+
+    fn reset(work: u64) void {
+        for (&served) |*v| v.store(0, .monotonic);
+        for (&slot_seen_by) |*v| v.store(0, .monotonic);
+        slot_conflicts.store(0, .monotonic);
+        work_us = work;
+    }
+
+    fn totalServed() u32 {
+        var n: u32 = 0;
+        for (&served) |*v| n += v.load(.monotonic);
+        return n;
+    }
+
+    fn workersUsed() usize {
+        var n: usize = 0;
+        for (&served) |*v| {
+            if (v.load(.monotonic) > 0) n += 1;
+        }
+        return n;
+    }
+};
+
+fn startCluster(
+    cluster: *loom.Cluster(ClusterHandler),
+    allocator: std.mem.Allocator,
+    handlers: []const ClusterHandler,
+    max: usize,
+) !void {
+    try cluster.init(.{
+        .server_addr = "127.0.0.1",
+        .server_port = 0,
+        .max = max,
+    }, allocator, handlers);
+    try cluster.start();
+}
+
+test "cluster serves requests" {
+    const allocator = std.heap.page_allocator;
+    ClusterHandler.reset(0);
+
+    const handlers = [_]ClusterHandler{ .{ .id = 0 }, .{ .id = 1 }, .{ .id = 2 }, .{ .id = 3 } };
+    var cluster: loom.Cluster(ClusterHandler) = undefined;
+    try startCluster(&cluster, allocator, &handlers, 64);
+    defer cluster.deinit();
+
+    var buf: [64]u8 = undefined;
+    for (0..40) |_| {
+        const conn = try harness.Conn.open(cluster.boundPort());
+        defer conn.close();
+        try conn.send(harness.get_request);
+        const n = try conn.recv(&buf);
+        try testing.expect(std.mem.startsWith(u8, buf[0..n], "HTTP/1.1 200 OK"));
+    }
+
+    try testing.expectEqual(@as(u32, 40), ClusterHandler.totalServed());
+}
+
+// Workers hold disjoint slot ranges so a slot identifies one connection
+// across the whole server. If the ranges overlapped, two live connections
+// on different workers would collide in any downstream structure keyed by
+// slot.
+test "cluster: workers never hand out overlapping slots" {
+    const allocator = std.heap.page_allocator;
+    ClusterHandler.reset(0);
+
+    const handlers = [_]ClusterHandler{ .{ .id = 0 }, .{ .id = 1 }, .{ .id = 2 }, .{ .id = 3 } };
+    var cluster: loom.Cluster(ClusterHandler) = undefined;
+    try startCluster(&cluster, allocator, &handlers, 64);
+    defer cluster.deinit();
+
+    // Hold connections open concurrently so slots are in use at once.
+    const conns = try allocator.alloc(harness.Conn, 48);
+    defer allocator.free(conns);
+    var opened: usize = 0;
+    defer for (conns[0..opened]) |c| c.close();
+    while (opened < conns.len) : (opened += 1) {
+        conns[opened] = try harness.Conn.open(cluster.boundPort());
+    }
+
+    var buf: [64]u8 = undefined;
+    for (conns) |c| try c.send(harness.get_request);
+    for (conns) |c| _ = try c.recv(&buf);
+
+    try testing.expectEqual(@as(u32, 0), ClusterHandler.slot_conflicts.load(.monotonic));
+}
+
+// The shared listener spreads connections by availability: a worker busy
+// in a handler is not parked in `kevent` ready to win the accept race. It
+// only balances once requests actually cost something, which is why this
+// gives the handler a little work to do.
+test "cluster: load spreads across workers" {
+    const allocator = std.heap.page_allocator;
+    ClusterHandler.reset(2000); // 2ms per request
+
+    const handlers = [_]ClusterHandler{ .{ .id = 0 }, .{ .id = 1 }, .{ .id = 2 }, .{ .id = 3 } };
+    var cluster: loom.Cluster(ClusterHandler) = undefined;
+    try startCluster(&cluster, allocator, &handlers, 64);
+    defer cluster.deinit();
+
+    // Concurrent clients, so several workers can be busy at once.
+    const Client = struct {
+        fn run(port: u16, n: usize) void {
+            var buf: [64]u8 = undefined;
+            for (0..n) |_| {
+                const conn = harness.Conn.open(port) catch continue;
+                defer conn.close();
+                conn.send(harness.get_request) catch continue;
+                _ = conn.recv(&buf) catch continue;
+            }
+        }
+    };
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Client.run, .{ cluster.boundPort(), 10 });
+    for (threads) |t| t.join();
+
+    try testing.expect(ClusterHandler.totalServed() > 0);
+    // Every worker should have taken a share. Exact numbers are up to the
+    // kernel, so this asserts participation, not proportions.
+    try testing.expectEqual(@as(usize, handlers.len), ClusterHandler.workersUsed());
+}
+
+test "cluster: stop and deinit release everything" {
+    var debug_allocator = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    const allocator = debug_allocator.allocator();
+
+    {
+        ClusterHandler.reset(0);
+        const handlers = [_]ClusterHandler{ .{ .id = 0 }, .{ .id = 1 } };
+        var cluster: loom.Cluster(ClusterHandler) = undefined;
+        try startCluster(&cluster, allocator, &handlers, 16);
+        defer cluster.deinit();
+
+        var buf: [64]u8 = undefined;
+        for (0..20) |_| {
+            const conn = try harness.Conn.open(cluster.boundPort());
+            defer conn.close();
+            try conn.send(harness.get_request);
+            _ = try conn.recv(&buf);
+        }
+
+        cluster.stop();
+        cluster.join();
+    }
+
+    try testing.expectEqual(std.heap.Check.ok, debug_allocator.deinit());
+}
+
+test "cluster: rejects a configuration it cannot honour" {
+    const allocator = std.heap.page_allocator;
+    var cluster: loom.Cluster(ClusterHandler) = undefined;
+
+    // No workers.
+    try testing.expectError(error.InvalidConfig, cluster.init(.{
+        .server_addr = "127.0.0.1",
+        .server_port = 0,
+    }, allocator, &.{}));
+
+    // Fewer connection slots than workers would leave a worker unable to
+    // accept anything at all.
+    const handlers = [_]ClusterHandler{ .{ .id = 0 }, .{ .id = 1 }, .{ .id = 2 } };
+    try testing.expectError(error.InvalidConfig, cluster.init(.{
+        .server_addr = "127.0.0.1",
+        .server_port = 0,
+        .max = 2,
+    }, allocator, &handlers));
+}
+
+/// Serves a response far larger than any socket send buffer.
+var huge_response: []u8 = &.{};
+
+const HugeHandler = struct {
+    pub fn process(_: HugeHandler, client: *loom.Client, _: []const u8) !void {
+        try client.write(huge_response);
+    }
+};
+
+// The interesting half of the write path only runs when the kernel
+// refuses the whole response at once: the send parks, the poller is asked
+// to report writability, and the pump resumes later.
+//
+// Getting there takes more than a slow reader. `send` returns as soon as
+// the data is copied into the socket's *send* buffer, and Linux autotunes
+// that to several megabytes — so a one-megabyte response is accepted
+// whole no matter how slowly the peer reads, and this path went entirely
+// unexercised on Linux until this test existed. The response therefore
+// has to be bigger than any plausible send buffer, and the client
+// throttled so it cannot drain it as fast as the server offers it.
+test "responses larger than the socket buffer are resumed correctly" {
+    const allocator = std.heap.page_allocator;
+
+    const body_len = 8 * 1024 * 1024;
+    const buf = try allocator.alloc(u8, body_len + 128);
+    defer allocator.free(buf);
+    huge_response = try harness.buildResponse(buf, body_len, 'Z');
+
+    var server = try harness.Server(HugeHandler).start(allocator, .{}, .{
+        .max = 8,
+        .max_body_size = body_len + 1024,
+    });
+    defer server.stop();
+
+    const conn = try harness.Conn.openThrottled(server.port, 64 * 1024);
+    defer conn.close();
+
+    try conn.send(harness.get_request);
+
+    // Every byte has to arrive, in order. A resume that loses its place
+    // shows up as a gap or a repeated chunk, not just a short read.
+    const got = try allocator.alloc(u8, huge_response.len);
+    defer allocator.free(got);
+    try conn.recvExactly(got);
+    try testing.expectEqualSlices(u8, huge_response, got);
+}
+
+/// Serves the huge response first, then small ones.
+const HugeThenSmallHandler = struct {
+    var served = std.atomic.Value(u32).init(0);
+
+    pub fn process(_: HugeThenSmallHandler, client: *loom.Client, _: []const u8) !void {
+        const n = served.fetchAdd(1, .monotonic);
+        if (n == 0) {
+            try client.write(huge_response);
+        } else {
+            try client.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        }
+    }
+};
+
+// A connection that parks a write has been switched to watching for
+// writability. Once the response drains it has to be switched back, or
+// the next request on that connection is never noticed and the client
+// hangs until the idle timeout kills it.
+//
+// The plain keep-alive test cannot catch this: its responses are small
+// enough that the write never parks, so the connection never leaves read
+// mode in the first place.
+test "keep-alive still works after a response that had to park" {
+    const allocator = std.heap.page_allocator;
+    HugeThenSmallHandler.served.store(0, .monotonic);
+
+    const body_len = 8 * 1024 * 1024;
+    const buf = try allocator.alloc(u8, body_len + 128);
+    defer allocator.free(buf);
+    huge_response = try harness.buildResponse(buf, body_len, 'Z');
+
+    var server = try harness.Server(HugeThenSmallHandler).start(allocator, .{}, .{
+        .max = 8,
+        .max_body_size = body_len + 1024,
+    });
+    defer server.stop();
+
+    const conn = try harness.Conn.openThrottled(server.port, 64 * 1024);
+    defer conn.close();
+
+    // First request: big enough that the write pump has to park.
+    try conn.send(harness.get_request);
+    const got = try allocator.alloc(u8, huge_response.len);
+    defer allocator.free(got);
+    try conn.recvExactly(got);
+
+    // Second request on the same connection must still be served.
+    try conn.send(harness.get_request);
+    var small: [64]u8 = undefined;
+    const n = try conn.recv(&small);
+    try testing.expect(std.mem.startsWith(u8, small[0..n], "HTTP/1.1 200 OK"));
+}
+
+// ── Write payload ownership ────────────────────────────────────────
+
+/// Writes a large payload and then immediately scribbles over the buffer
+/// it came from, the way a handler using a per-request arena does when
+/// the arena is reset, or a stack buffer does when the frame returns.
+const ScribbleHandler = struct {
+    var payload: []u8 = &.{};
+    var scribbled = std.atomic.Value(u32).init(0);
+
+    pub fn process(_: ScribbleHandler, client: *loom.Client, _: []const u8) !void {
+        try client.write(payload);
+
+        // The send has parked by now: the response is far larger than
+        // the socket will take at once. Anything the client still needs
+        // must already be its own.
+        @memset(payload, 'X');
+        _ = scribbled.fetchAdd(1, .monotonic);
+    }
+};
+
+// `write` used to park the tail of a large payload as a slice borrowed
+// from the caller, so the bytes had to stay untouched for several event
+// loop iterations after `write` returned. Nothing said so at the call
+// site, and the threshold was invisible: payloads under the writer
+// buffer were copied and safe, larger ones were not.
+//
+// The failure only appears once the kernel refuses the whole payload at
+// once, so it hides on a fast loopback and shows up under real network
+// conditions -- intermittently, and only under load.
+test "regression: a payload may be reused the moment write returns" {
+    const allocator = std.heap.page_allocator;
+
+    const body_len = 8 * 1024 * 1024;
+    const buf = try allocator.alloc(u8, body_len + 128);
+    defer allocator.free(buf);
+    ScribbleHandler.payload = try harness.buildResponse(buf, body_len, 'A');
+    ScribbleHandler.scribbled.store(0, .monotonic);
+
+    // Keep a pristine copy to compare against; the handler destroys the
+    // original on purpose.
+    const expected = try allocator.alloc(u8, ScribbleHandler.payload.len);
+    defer allocator.free(expected);
+    @memcpy(expected, ScribbleHandler.payload);
+
+    var server = try harness.Server(ScribbleHandler).start(allocator, .{}, .{
+        .max = 8,
+        .max_body_size = body_len + 1024,
+    });
+    defer server.stop();
+
+    const conn = try harness.Conn.openThrottled(server.port, 64 * 1024);
+    defer conn.close();
+
+    try conn.send(harness.get_request);
+
+    const got = try allocator.alloc(u8, expected.len);
+    defer allocator.free(got);
+    try conn.recvExactly(got);
+
+    // The handler really did overwrite its buffer mid-send.
+    try testing.expectEqual(@as(u32, 1), ScribbleHandler.scribbled.load(.monotonic));
+    // ...and the peer still got the original bytes.
+    try testing.expectEqualSlices(u8, expected, got);
+}
+
+/// Sends a compile-time constant, which genuinely outlives everything.
+const BorrowedHandler = struct {
+    const body = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nstatic";
+
+    pub fn process(_: BorrowedHandler, client: *loom.Client, _: []const u8) !void {
+        try client.writeBorrowed(body);
+    }
+};
+
+test "writeBorrowed sends without copying" {
+    const allocator = std.heap.page_allocator;
+
+    var server = try harness.Server(BorrowedHandler).start(allocator, .{}, .{ .max = 8 });
+    defer server.stop();
+
+    const conn = try server.connect();
+    defer conn.close();
+
+    var buf: [128]u8 = undefined;
+    try conn.send(harness.get_request);
+    const n = try conn.recv(&buf);
+    try testing.expect(std.mem.endsWith(u8, buf[0..n], "\r\n\r\nstatic"));
+}
+
+/// Attempts a response larger than the configured ceiling.
+const OversizeHandler = struct {
+    var rejected = std.atomic.Value(u32).init(0);
+    var big: []u8 = &.{};
+
+    pub fn process(_: OversizeHandler, client: *loom.Client, _: []const u8) !void {
+        if (client.write(big)) |_| {} else |err| {
+            if (err == error.ResponseTooLarge) _ = rejected.fetchAdd(1, .monotonic);
+        }
+        // The connection is still perfectly usable.
+        try client.write("HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n");
+    }
+};
+
+// `max_body_size` was carried through `Config`, stored on the server, and
+// never read by anything -- so response size was in fact unbounded.
+test "writes beyond max_body_size are refused, not truncated" {
+    const allocator = std.heap.page_allocator;
+
+    const limit = 64 * 1024;
+    OversizeHandler.big = try allocator.alloc(u8, limit * 4);
+    defer allocator.free(OversizeHandler.big);
+    @memset(OversizeHandler.big, 'B');
+    OversizeHandler.rejected.store(0, .monotonic);
+
+    var server = try harness.Server(OversizeHandler).start(allocator, .{}, .{
+        .max = 8,
+        .max_body_size = limit,
+    });
+    defer server.stop();
+
+    const conn = try server.connect();
+    defer conn.close();
+
+    try conn.send(harness.get_request);
+    var buf: [256]u8 = undefined;
+    const n = try conn.recv(&buf);
+
+    try testing.expectEqual(@as(u32, 1), OversizeHandler.rejected.load(.monotonic));
+    try testing.expect(std.mem.startsWith(u8, buf[0..n], "HTTP/1.1 413"));
+}
+
+// The copy buffer is allocated lazily and reused across requests, so it
+// has to be released when the connection goes -- and it must not grow
+// without bound across many large responses on many connections.
+test "large-write copy buffers are released with the connection" {
+    var debug_allocator = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    const allocator = debug_allocator.allocator();
+
+    {
+        const body_len = 256 * 1024; // comfortably past the writer buffer
+        const buf = try allocator.alloc(u8, body_len + 128);
+        defer allocator.free(buf);
+        huge_response = try harness.buildResponse(buf, body_len, 'H');
+
+        var server = try harness.Server(HugeHandler).start(allocator, .{}, .{
+            .max = 4,
+            .max_body_size = body_len + 1024,
+        });
+        defer server.stop();
+
+        // Churn far more connections than there are slots, each pulling a
+        // response big enough to need the copy buffer.
+        for (0..24) |_| {
+            const conn = try harness.Conn.openThrottled(server.port, 16 * 1024);
+            defer conn.close();
+            try conn.send(harness.get_request);
+            try conn.drainExactly(huge_response.len);
+        }
+    }
+
+    try testing.expectEqual(std.heap.Check.ok, debug_allocator.deinit());
 }

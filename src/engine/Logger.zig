@@ -98,12 +98,12 @@ pub fn err(
 test "all logs" {
     var logger: Logger = undefined;
     logger.init();
-    try logger.warn("Panic in the building {s}", .{"Escape now🔥"});
-    try logger.debug("Here are the logs for age {d}", .{24});
-    try logger.info("INFO {s}", .{"accessining"});
-    try logger.err("ERROR {s}", .{"accessining"});
-    try logger.fatal("FATAL {s}", .{"accessining"});
+    try logger.warn("Panic in the building {s}", .{"Escape now"}, null);
+    try logger.debug("Here are the logs for age {d}", .{24}, null);
+    try logger.info("INFO {s}", .{"accessing"}, null);
+    try logger.err("ERROR {s}", .{"accessing"}, null);
+    try logger.fatal("FATAL {s}", .{"accessing"}, @src());
     const vec1: @Vector(5, i32) = .{ 1, 2, 3, 4, 5 };
     const vec2: @Vector(5, i32) = .{ 6, 7, 8, 9, 10 };
-    try logger.info("INFO {any}", .{vec1 + vec2});
+    try logger.info("INFO {any}", .{vec1 + vec2}, null);
 }

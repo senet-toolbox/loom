@@ -479,8 +479,6 @@ test "simple" {
         stacks[i] = stack;
     }
 
-
-
     while (counter < 10) {
         for (fibers[0..10]) |f| {
             if (f.status() != .Done) {

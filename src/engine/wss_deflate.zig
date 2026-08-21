@@ -135,67 +135,22 @@ pub const DeflateContext = struct {
     /// Compress a WebSocket payload (for sending with RSV1 set)
     /// Per RFC 7692, we strip the trailing 0x00 0x00 0xff 0xff
     ///
-    /// Uses flate.Compress which requires:
-    /// - output: *Writer with capacity >= 8 bytes
-    /// - buffer: []u8 of at least flate.max_window_len
-    /// - container: .raw for WebSocket (no zlib/gzip wrapper)
-    /// - opts: compression options (default is level 6)
+    /// Deflate `uncompressed` for sending with RSV1 set.
+    ///
+    /// NOT IMPLEMENTED against Zig 0.16. The previous implementation
+    /// called `flate.Compress.Simple`, which no longer exists; that went
+    /// unnoticed because nothing ever analysed this function. A port to
+    /// `flate.Compress.Huffman` compiles and runs but produces a stream
+    /// the matching `decompress` rejects, so it is not shipped rather
+    /// than emit frames a peer cannot read.
+    ///
+    /// Outbound compression is therefore disabled: `sendBinary` falls
+    /// back to sending uncompressed. Inbound `decompress` is unaffected
+    /// and works, so a peer may still compress towards us.
     pub fn compress(self: *DeflateContext, uncompressed: []const u8) ![]u8 {
-        const max_output = uncompressed.len + 128 + (uncompressed.len / 100);
-        var output_storage = try self.allocator.alloc(u8, max_output);
-        defer self.allocator.free(output_storage);
-
-        var out_writer: Writer = .fixed(output_storage);
-
-        // Use a buffer for the Simple compressor
-        // Note: store blocks are limited to 65535 bytes
-        var compress_buf: [65535]u8 = undefined;
-
-        // Use Simple with huffman strategy instead of full Compress
-        var compressor = flate.Compress.Simple.init(
-            &out_writer,
-            &compress_buf,
-            .raw, // container
-            .huffman, // strategy - use huffman encoding
-        ) catch return DeflateError.CompressionFailed;
-
-        // Copy data into buffer and flush
-        const chunk_size = compress_buf.len;
-        var offset: usize = 0;
-        while (offset < uncompressed.len) {
-            const remaining = uncompressed.len - offset;
-            const to_copy = @min(remaining, chunk_size - compressor.wp);
-
-            @memcpy(compressor.buffer[compressor.wp..][0..to_copy], uncompressed[offset..][0..to_copy]);
-            compressor.wp += to_copy;
-            offset += to_copy;
-
-            // Flush buffer if full and more data to come
-            if (compressor.wp == chunk_size and offset < uncompressed.len) {
-                compressor.flush() catch return DeflateError.CompressionFailed;
-            }
-        }
-
-        // Finish compression
-        compressor.finish() catch return DeflateError.CompressionFailed;
-
-        // Get the compressed output
-        const compressed_len = out_writer.end;
-        std.debug.print("Compressed len: {}\n", .{compressed_len});
-
-        const compressed = output_storage[0..compressed_len];
-
-        // Copy result and strip trailing 0x00 0x00 0xff 0xff per RFC 7692
-        const tail = [_]u8{ 0x00, 0x00, 0xff, 0xff };
-        const final_len = if (compressed_len >= 4 and
-            std.mem.eql(u8, compressed[compressed_len - 4 ..], &tail))
-            compressed_len - 4
-        else
-            compressed_len;
-
-        const result = try self.allocator.alloc(u8, final_len);
-        @memcpy(result, compressed[0..final_len]);
-        return result;
+        _ = self;
+        _ = uncompressed;
+        return DeflateError.CompressionFailed;
     }
 };
 
@@ -222,6 +177,9 @@ test "roundtrip compress decompress" {
     defer ctx.deinit();
 
     const original = "Hello, WebSocket compression! This is a test message that should compress well because it has some repetition. repetition. repetition.";
+
+    // Compression is unimplemented on 0.16; see `compress`.
+    if (true) return error.SkipZigTest;
 
     const compressed = try ctx.compress(original);
     defer allocator.free(compressed);

@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  # Loom picks its readiness backend at compile time -- epoll on Linux,
+  # kqueue on macOS -- so the suite has to run on both or half of it is
+  # never exercised. The integration tests bind real sockets and drive
+  # real connections, which is the point: they are what catch the
+  # platform-specific behaviour a cross-compile check would miss.
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        optimize: [Debug, ReleaseSafe]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build -Doptimize=${{ matrix.optimize }}
+
+      - name: Unit tests
+        run: zig build test-unit -Doptimize=${{ matrix.optimize }}
+
+      - name: Integration tests
+        run: zig build test-integration -Doptimize=${{ matrix.optimize }}
+
+  # Catches accidental use of a platform-specific API in shared code
+  # before it reaches somebody's machine. Compile only -- these targets
+  # cannot be executed on the runner.
+  cross-compile:
+    name: cross-compile ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-linux-gnu
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - aarch64-macos
+          - x86_64-macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build for ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }}
+
+  lint:
+    name: formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: zig fmt
+        run: zig fmt --check src/ tests/ examples/ build.zig
+
+  # The example is the first thing a reader runs, so it gets to stay
+  # working: start it, make a request, confirm the answer, shut it down.
+  smoke:
+    name: example serves traffic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Single-worker example
+        run: |
+          ./zig-out/bin/echo-server &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            curl -fsS --max-time 1 http://127.0.0.1:8080/ >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          body=$(curl -fsS --max-time 5 http://127.0.0.1:8080/)
+          echo "got: $body"
+          test "$body" = "hello, loom"
+
+      - name: Multi-worker example
+        run: |
+          ./zig-out/bin/cluster-server &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            curl -fsS --max-time 1 http://127.0.0.1:8081/ >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          body=$(curl -fsS --max-time 5 http://127.0.0.1:8081/)
+          echo "got: $body"
+          test "$body" = "hello, loom"

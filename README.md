@@ -1,5 +1,7 @@
 # Loom
 
+[![CI](https://github.com/tether-labs/Loom/actions/workflows/ci.yml/badge.svg)](https://github.com/tether-labs/Loom/actions/workflows/ci.yml)
+
 A single-threaded, non-blocking event loop for TCP servers, written in Zig.
 
 Loom owns the socket lifecycle: accepting connections, watching them with
@@ -7,14 +9,17 @@ Loom owns the socket lifecycle: accepting connections, watching them with
 asynchronously, and dropping connections that stall. It does **not**
 interpret those bytes — there is no HTTP parsing, no message framing, no
 routing. That belongs in a protocol layer on top;
-[Reverb](https://github.com/vic-Rokx/reverb) is the HTTP server built on
+[Reverb](https://github.com/vic-Rokx/tether) is the HTTP server built on
 this.
 
 ## Requirements
 
 - Zig 0.16.0
-- macOS or BSD. Loom is `kqueue`-only — there is no `epoll`, `io_uring`,
-  or Windows backend yet.
+- Linux (`epoll`) or macOS/BSD (`kqueue`). Windows is not supported.
+
+The readiness backend is chosen at compile time and both are exercised by
+the same test suite; see `src/engine/Poller.zig` for the contract they
+share.
 
 ## Usage
 
@@ -51,6 +56,68 @@ zig build run-example
 curl -i http://127.0.0.1:8080/
 ```
 
+## Multiple workers
+
+`Cluster` runs several event loops over one listening socket. Each worker
+is a complete `Loom` on its own thread with its own kqueue, client pool,
+connection slots and timeout list — nothing mutable is shared.
+
+```zig
+const handlers = [_]Handler{ .{}, .{}, .{}, .{} }; // one per worker
+
+var cluster: loom.Cluster(Handler) = undefined;
+try cluster.init(.{ .server_port = 8080, .max = 1024 }, allocator, &handlers);
+defer cluster.deinit();
+
+try cluster.serve(); // until cluster.stop()
+```
+
+The worker count is exactly `handlers.len`, which keeps the sharing
+decision visible at the call site: pass distinct handlers for
+shared-nothing workers, or the same pointer repeated if that handler is
+genuinely safe to use from several threads. `max` is the limit across the
+whole server, split evenly, and connection slots stay unique server-wide
+so a slot still identifies exactly one live connection.
+
+The allocator is used by every worker concurrently and must be
+thread-safe — `std.heap.smp_allocator` is a good default.
+
+**Per-worker counters.** Each worker keeps a `stats` struct — connections
+accepted, listener wakeups, wakeups that lost the accept race,
+connections refused at capacity, connections timed out. They are plain
+integers rather than atomics because a worker is only ever touched by its
+own thread, so they cost nothing on the hot path. Read them off
+`cluster.workers[i].stats`.
+
+**How connections are distributed.** Every worker registers the shared
+listener in its own kqueue and they race to accept. The race balances by
+availability: a worker busy inside a handler is not parked in `kevent`
+ready to win, so connections drift toward idle workers. That is
+load-proportional, and a slow worker naturally stops taking new work.
+
+`SO_REUSEPORT` is deliberately not used to give each worker its own
+listener. On Linux the kernel would load-balance across them, but Darwin
+and the BSDs deliver every connection to the most recently bound socket —
+measured here as all 40 of 40 connections landing on one listener — which
+would leave every worker but one idle. Using kernel load balancing on
+Linux while keeping the shared listener elsewhere is a worthwhile future
+split; today both platforms share one listener.
+
+Scaling on a 10-core M-series machine, with a CPU-bound handler and the
+load generator sharing the box:
+
+| workers | req/s | speedup |
+| --- | --- | --- |
+| 1 | 18,397 | 1.00× |
+| 2 | 35,019 | 1.90× |
+| 4 | 65,904 | 3.58× |
+| 8 | 94,851 | 5.16× |
+
+```
+zig build run-cluster
+curl -i http://127.0.0.1:8081/
+```
+
 ## Configuration
 
 | Field | Default | Meaning |
@@ -58,7 +125,7 @@ curl -i http://127.0.0.1:8080/
 | `server_addr` | `"0.0.0.0"` | Interface to bind. |
 | `server_port` | `8080` | Port to bind. `0` lets the kernel choose; read it back with `boundPort()`. |
 | `max` | `256` | Maximum concurrent connections. The listener parks when full and re-arms as slots free. |
-| `max_body_size` | `4 MiB` | Largest response body accepted by `write`. |
+| `max_body_size` | `4 MiB` | Largest payload `write` accepts; bigger ones get `error.ResponseTooLarge`. `0` disables the limit. |
 | `initial_read_size` | `16 KiB` | Size of a connection's read buffer at accept. |
 | `max_read_size` | `2 MiB` | Ceiling a connection's read buffer may grow to. |
 | `idle_timeout_ms` | `60_000` | Drop connections that make no progress for this long. `0` disables. |
@@ -79,7 +146,13 @@ curl -i http://127.0.0.1:8080/
 On a `*Client`:
 
 - `write(bytes)` — send, chunking through the writer buffer and finishing
-  asynchronously if the kernel won't take it all at once.
+  asynchronously if the kernel won't take it all at once. Copies whatever
+  is still outstanding when it returns, so `bytes` may be a stack buffer
+  or arena memory reused immediately afterwards.
+- `writeBorrowed(bytes)` — the same, without the copy. The caller
+  guarantees `bytes` stays valid and unchanged until the send drains,
+  which may be several event-loop iterations later. For string literals
+  and other genuinely stable memory.
 - `fillWriteBuffer(bytes)` — buffer without sending, to coalesce a header
   and body into one syscall.
 - `sendFile(file)` — stream a file; ownership transfers to the client.
@@ -102,9 +175,10 @@ connection does can disturb it. Each buffer starts at
 back full, so only connections that actually send a lot pay for a large
 buffer.
 
-**Write payloads are borrowed.** A payload too large for the 64 KiB writer
-buffer is held as a slice until it drains. Keep the backing memory alive
-until the next read event on that connection.
+**Write payloads are copied.** Anything still outstanding when `write`
+returns belongs to the client, so a handler is free to reuse or discard
+its buffers immediately. `writeBorrowed` skips the copy when the payload
+outlives the request anyway.
 
 **Timeouts measure progress, not silence.** The idle deadline is refreshed
 by every read *and* by every write the kernel accepts, so a slow but
@@ -118,6 +192,10 @@ zig build test-unit
 zig build test-integration
 ```
 
+CI runs the whole suite on Linux and macOS, in both `Debug` and
+`ReleaseSafe`, plus a cross-compile check across five targets and a smoke
+test that starts each example and makes a real request against it.
+
 The end-to-end suite stands up real servers on ephemeral ports and drives
 them over real sockets, including disconnect storms, saturation, and
 timeout expiry. Every regression test in it was verified by
@@ -127,12 +205,24 @@ re-introducing the bug it guards.
 
 Pre-1.0. Known gaps:
 
-- `kqueue` only; no `epoll`, `io_uring`, or Windows.
+- No `io_uring` backend; Linux uses `epoll`.
+- Outbound websocket `permessage-deflate` compression is not implemented
+  on Zig 0.16 (`flate.Compress.Simple` no longer exists). Inbound
+  decompression works, so peers may still compress towards us.
 - Only the AArch64 coroutine assembly is present, so the (currently
   unused) `Scheduler` will not build for x86_64 or RISC-V.
-- Single-threaded. `SO_REUSEPORT` is set on the listener, so running one
-  instance per thread or process is the intended way to scale for now,
-  but Loom does not do that for you.
+- Connection distribution across cluster workers is decided by an accept
+  race rather than an explicit scheduler. It balances well once handlers
+  do real work, but a server whose handlers return almost instantly will
+  see most connections land on one worker.
+- Workers share one listener, so several wake on each incoming connection
+  and all but one lose the race. Measured at 42% of listener wakeups
+  wasted with 8 workers under connection churn — but that is roughly
+  1,500 wasted wakeups a second, two cheap syscalls each, so well under
+  1% of a core. It is also per *connection*, so keep-alive amortises it
+  away almost entirely. `epoll` has `EPOLLEXCLUSIVE` for this; kqueue has
+  no equivalent, so the alternative would be an nginx-style rotating
+  accept mutex.
 
 ## License
 

@@ -34,6 +34,26 @@ pub fn build(b: *std.Build) void {
     const run_example_step = b.step("run-example", "Run the example echo server");
     run_example_step.dependOn(&run_example.step);
 
+    const cluster_example = b.addExecutable(.{
+        .name = "cluster-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/cluster_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "loom", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(cluster_example);
+
+    const run_cluster = b.addRunArtifact(cluster_example);
+    run_cluster.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cluster.addArgs(args);
+
+    const run_cluster_step = b.step("run-cluster", "Run the multi-worker example server");
+    run_cluster_step.dependOn(&run_cluster.step);
+
     // Unit tests: whatever `test` blocks the library's own sources declare.
     const mod_tests = b.addTest(.{ .root_module = mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);

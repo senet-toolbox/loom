@@ -248,6 +248,28 @@ pub const Conn = struct {
         }
     }
 
+    /// Connect with a deliberately tiny receive buffer.
+    ///
+    /// Forces the server's send to hit EAGAIN quickly, which is the only
+    /// way to exercise the parked-write path on platforms whose loopback
+    /// buffers would otherwise swallow the whole response in one call.
+    pub fn openThrottled(port: u16, recv_buf_bytes: c_int) !Conn {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const conn = openOnce(port) catch |err| switch (err) {
+                error.ConnectBackpressure => {
+                    if (attempt >= 400) return error.ConnectFailed;
+                    sleepMs(5);
+                    continue;
+                },
+                else => return err,
+            };
+            const size = recv_buf_bytes;
+            posix.setsockopt(conn.fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&size)) catch {};
+            return conn;
+        }
+    }
+
     fn openOnce(port: u16) !Conn {
         const rc = system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
         if (@intFromEnum(posix.errno(rc)) != 0) return error.SocketFailed;

@@ -1,7 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const KQueue = @import("KQueue.zig");
+const Poller = @import("Poller.zig").Backend;
 const Loom = @import("Loom.zig");
 const Websocket = @import("Websocket.zig");
 
@@ -31,7 +32,7 @@ const ConnectionType = enum {
 pub const ClientList = std.DoublyLinkedList;
 
 pub const Client = @This();
-kqueue: *KQueue,
+poller: *Poller,
 
 socket: posix.socket_t,
 address: std.Io.net.IpAddress,
@@ -88,9 +89,24 @@ grow_read_buf: bool = false,
 /// Allocator that owns `read_buf`. Held so the buffer can grow without
 /// the read path having to reach back into the server.
 arena: Allocator = undefined,
-// Overflow tail of an in-flight slice send. While non-null, the
-// client is mid-async-send and refuses new writes.
+/// Largest payload `write` will accept. 0 means unlimited.
+max_body_size: usize = 0,
+
+/// Overflow tail of an in-flight send. While non-null, the client is
+/// mid-async-send and refuses new writes.
+///
+/// Points into `pending_buf` for `write`, and into caller memory for
+/// `writeBorrowed`.
 pending: ?[]const u8 = null,
+
+/// Client-owned storage for the part of a `write` payload that did not
+/// fit in the writer buffer.
+///
+/// The whole point of copying: a parked send outlives the call that
+/// started it, so anything still referenced when the handler returns has
+/// to belong to the client. Grown to fit and reused across requests,
+/// since only one send is ever in flight per connection.
+pending_buf: []u8 = &.{},
 // In-flight file send. Owned by the client while non-null — closed
 // on EOF, on error, or when the client disconnects. Drained by the
 // pump after `pending` (so a `write(headers); sendFile(file)`
@@ -102,9 +118,10 @@ pub fn init(
     io: std.Io,
     socket: posix.socket_t,
     address: std.Io.net.IpAddress,
-    kqueue: *KQueue,
+    poller: *Poller,
     initial_read_size: usize,
     max_read_size: usize,
+    max_body_size: usize,
 ) !Client {
     const writer = try Writer.init(arena, 4096);
     errdefer writer.deinit(arena);
@@ -113,7 +130,7 @@ pub fn init(
     errdefer arena.free(read_buf);
 
     return .{
-        .kqueue = kqueue,
+        .poller = poller,
         .socket = socket,
         .address = address,
         .msg = "",
@@ -123,6 +140,7 @@ pub fn init(
         .io = io,
         .read_buf = read_buf,
         .max_read_size = max_read_size,
+        .max_body_size = max_body_size,
         .arena = arena,
     };
 }
@@ -132,6 +150,11 @@ pub fn deinit(self: *Client, arena: Allocator) void {
         arena.free(self.read_buf);
         self.read_buf = &.{};
     }
+    if (self.pending_buf.len != 0) {
+        arena.free(self.pending_buf);
+        self.pending_buf = &.{};
+    }
+    self.pending = null;
 }
 
 fn findEndOfHeaders(buffer: []const u8) ?usize {
@@ -256,28 +279,64 @@ pub fn isWriting(self: *const Client) bool {
     return self.pending != null or self.pending_file != null or self.writer.offset < self.writer.pos;
 }
 
-/// Append `msg` to the writer buffer (overflow goes into `pending`)
-/// then drive the write state machine forward as far as the kernel
-/// will accept right now.
+/// Send `msg`, copying anything that does not fit in the writer buffer
+/// so the caller keeps no obligations once this returns.
 ///
 /// Returns synchronously in two cases:
-///   - Everything sent in one go (fast path for small responses).
-///   - Kernel returned EAGAIN; `EVFILT.WRITE` has been armed and the
-///     event loop will resume the send via `continueWrite` when the
-///     socket becomes writable.
+///   - Everything went out in one go (the fast path for small
+///     responses, which never allocates or copies beyond the writer
+///     buffer).
+///   - The kernel returned EAGAIN. The poller has been asked to report
+///     writability and the event loop resumes the send later.
 ///
-/// Returns `error.WriteInProgress` if a previous async send is still
-/// in flight — the caller must wait for it to drain before queuing
-/// the next message.
+/// Returns `error.WriteInProgress` if a previous send is still draining,
+/// and `error.ResponseTooLarge` if `msg` exceeds `Config.max_body_size`.
 ///
-/// Lifetime: the caller must ensure `msg` outlives the write. If
-/// `msg` does not fit in the writer buffer, a slice into it is
-/// stashed as `pending` until later draining. For dynamically
-/// allocated payloads, hold the backing storage until the next
-/// READ event arrives on this client (which guarantees the previous
-/// response has been fully sent).
+/// Lifetime: none. `msg` may be a stack buffer, arena memory reset
+/// immediately afterwards, or anything else — the client owns a copy of
+/// whatever is still outstanding. Use `writeBorrowed` to skip that copy
+/// when the payload is genuinely stable.
 pub fn write(self: *Client, msg: []const u8) !void {
     if (self.pending != null or self.pending_file != null) return error.WriteInProgress;
+    if (self.max_body_size != 0 and msg.len > self.max_body_size) {
+        return error.ResponseTooLarge;
+    }
+
+    const room = self.writer.buf.len - self.writer.pos;
+    const take = @min(msg.len, room);
+    try self.writer.fillWriteBuffer(msg[0..take]);
+
+    if (take < msg.len) {
+        // The tail outlives this call, so it has to be ours. Only one
+        // send is in flight at a time, so the buffer is reused rather
+        // than reallocated per response.
+        const tail = msg[take..];
+        if (self.pending_buf.len < tail.len) {
+            self.pending_buf = try self.arena.realloc(self.pending_buf, tail.len);
+        }
+        @memcpy(self.pending_buf[0..tail.len], tail);
+        self.pending = self.pending_buf[0..tail.len];
+    }
+
+    try self.pumpWrite();
+}
+
+/// Send `msg` without copying it.
+///
+/// The caller guarantees `msg` stays valid and unchanged until the send
+/// completes — which may be several event-loop iterations after this
+/// returns, once the payload is larger than the writer buffer. Getting
+/// that wrong corrupts responses intermittently under load, and only
+/// under load, so this is strictly for memory that genuinely outlives
+/// the request: string literals, `comptime` data, or a buffer the caller
+/// owns for the lifetime of the connection.
+///
+/// When in doubt use `write`, which copies.
+pub fn writeBorrowed(self: *Client, msg: []const u8) !void {
+    if (self.pending != null or self.pending_file != null) return error.WriteInProgress;
+    if (self.max_body_size != 0 and msg.len > self.max_body_size) {
+        return error.ResponseTooLarge;
+    }
 
     const room = self.writer.buf.len - self.writer.pos;
     const take = @min(msg.len, room);
@@ -323,8 +382,8 @@ pub fn sendFile(self: *Client, file: std.Io.File) !void {
 }
 
 /// Drive the writer state machine forward. On EAGAIN (or partial
-/// write), arms `EVFILT.WRITE` so the event loop will resume the
-/// send when the socket is writable. Used internally by `write`
+/// write), asks the poller to report writability so the event loop
+/// can resume the send. Used internally by `write`
 /// and `continueWrite`.
 fn pumpWrite(self: *Client) !void {
     while (true) {
@@ -334,9 +393,9 @@ fn pumpWrite(self: *Client) !void {
                 // Either kernel EAGAIN or a partial write. Park the
                 // rest until the socket is writable. EVFILT.WRITE is
                 // level-triggered for this client so a single arm is
-                // enough — kqueue will keep firing as long as there's
-                // send-buffer space.
-                try self.kqueue.writeMode(self);
+                // enough — the poller keeps reporting writability as
+                // long as there's send-buffer space.
+                try self.poller.writeMode(self);
                 return;
             },
             else => return err,
@@ -377,14 +436,13 @@ fn pumpWrite(self: *Client) !void {
     }
 }
 
-/// Called by the event loop when `EVFILT.WRITE` fires for this
-/// client. Drives the write state machine and, on completion, flips
+/// Called by the event loop when this client becomes writable. Drives the write state machine and, on completion, flips
 /// the client back to read mode for the next request (HTTP/1.1
 /// keep-alive).
 pub fn continueWrite(self: *Client) !void {
     try self.pumpWrite();
     if (!self.isWriting()) {
-        try self.kqueue.readMode(self);
+        try self.poller.readMode(self);
     }
 }
 
@@ -425,8 +483,25 @@ const Reader = struct {
     }
 };
 
+/// Writing to a socket whose peer has gone raises SIGPIPE, and the
+/// default disposition of SIGPIPE kills the process. Each platform
+/// suppresses that differently:
+///
+///   * Darwin/BSD set `SO_NOSIGPIPE` once, per accepted socket, so an
+///     ordinary `write` is already safe (see `Loom.setNoSigPipe`).
+///   * Linux has no such option and needs `MSG_NOSIGNAL` on every call,
+///     which means going through `send` rather than `write`.
+///
+/// Either way the failure comes back as EPIPE and the client is dropped.
+const use_send_nosignal = builtin.os.tag == .linux;
+
 fn posixWrite(fd: i32, buf: []const u8) !usize {
-    const rc = posix.system.write(fd, buf.ptr, buf.len);
+    // `send` with no address is `sendto` with a null one; Linux's raw
+    // syscall layer only exposes the latter.
+    const rc = if (use_send_nosignal)
+        posix.system.sendto(fd, buf.ptr, buf.len, posix.MSG.NOSIGNAL, null, 0)
+    else
+        posix.system.write(fd, buf.ptr, buf.len);
     const e = posix.system.errno(rc);
     if (e != .SUCCESS) return switch (e) {
         .AGAIN => error.WouldBlock,
@@ -519,3 +594,53 @@ const Writer = struct {
         self.offset = 0;
     }
 };
+
+test "writing to a hung-up peer reports EPIPE instead of killing the process" {
+    // Guards the SIGPIPE suppression, which each platform does
+    // differently and which is fatal to get wrong: the default
+    // disposition of SIGPIPE terminates the process, so a single client
+    // hanging up mid-response would take the whole server down.
+    //
+    // Deterministic where the socket-level race is not: a socketpair with
+    // one end closed puts the write path in exactly the state that
+    // raises SIGPIPE, with no timing involved. If suppression is broken
+    // on either platform, this test process dies rather than failing.
+    var fds: [2]posix.socket_t = undefined;
+    const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    defer _ = posix.system.close(fds[0]);
+
+    // Darwin suppresses per socket, exactly as the server does on accept.
+    // Linux has no such option and relies on MSG_NOSIGNAL per write,
+    // which `posixWrite` applies itself.
+    if (@hasDecl(std.c.SO, "NOSIGPIPE")) {
+        const on: c_int = 1;
+        _ = posix.system.setsockopt(
+            fds[0],
+            posix.SOL.SOCKET,
+            std.c.SO.NOSIGPIPE,
+            &on,
+            @sizeOf(c_int),
+        );
+    }
+
+    // Peer goes away.
+    _ = posix.system.close(fds[1]);
+
+    // Keep writing until the failure surfaces. The first write after a
+    // close can still succeed into the socket buffer, so one attempt is
+    // not enough to prove anything.
+    const payload = [_]u8{'x'} ** 4096;
+    var attempts: usize = 0;
+    while (attempts < 1000) : (attempts += 1) {
+        _ = posixWrite(fds[0], &payload) catch |err| {
+            try std.testing.expect(
+                err == error.BrokenPipe or
+                    err == error.ConnectionReset or
+                    err == error.WouldBlock,
+            );
+            return;
+        };
+    }
+    return error.WriteNeverFailed;
+}
