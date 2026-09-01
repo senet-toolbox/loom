@@ -84,7 +84,7 @@ jobs:
   # The example is the first thing a reader runs, so it gets to stay
   # working: start it, make a request, confirm the answer, shut it down.
   smoke:
-    name: example serves traffic
+    name: examples serve and shut down
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -96,11 +96,13 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseSafe
 
+      # Serve a request, then SIGTERM and require a clean exit. A server
+      # that ignores the signal, or that leaks or crashes on the way out,
+      # fails here rather than in somebody's container.
       - name: Single-worker example
         run: |
           ./zig-out/bin/echo-server &
           pid=$!
-          trap 'kill $pid 2>/dev/null || true' EXIT
           for _ in $(seq 1 50); do
             curl -fsS --max-time 1 http://127.0.0.1:8080/ >/dev/null 2>&1 && break
             sleep 0.2
@@ -108,12 +110,14 @@ jobs:
           body=$(curl -fsS --max-time 5 http://127.0.0.1:8080/)
           echo "got: $body"
           test "$body" = "hello, loom"
+          kill -TERM $pid
+          wait $pid
+          echo "exited cleanly"
 
       - name: Multi-worker example
         run: |
           ./zig-out/bin/cluster-server &
           pid=$!
-          trap 'kill $pid 2>/dev/null || true' EXIT
           for _ in $(seq 1 50); do
             curl -fsS --max-time 1 http://127.0.0.1:8081/ >/dev/null 2>&1 && break
             sleep 0.2
@@ -121,3 +125,6 @@ jobs:
           body=$(curl -fsS --max-time 5 http://127.0.0.1:8081/)
           echo "got: $body"
           test "$body" = "hello, loom"
+          kill -TERM $pid
+          wait $pid
+          echo "exited cleanly"

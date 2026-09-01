@@ -140,7 +140,7 @@ curl -i http://127.0.0.1:8081/
 - `listen()` — `bindListener` then `serve`.
 - `stop()` — ask the loop to finish. Safe from another thread or a signal
   handler while the loop is parked; `serve()` returns once the in-flight
-  batch is done.
+  batch is done. See *Shutdown* below.
 - `deinit()` — close live connections, the listener, and release everything.
 
 On a `*Client`:
@@ -160,6 +160,34 @@ On a `*Client`:
 - `slot` — dense connection index in `0..max`, stable for the
   connection's lifetime and never shared with another live connection.
   Useful as a key for your own per-connection state.
+
+## Shutdown
+
+`stop()` is built to be called from a signal handler: an atomic store and
+a single syscall to wake the loop. No allocation, no locks, nothing that
+minds being interrupted. `serve()` then returns and `deinit()` closes
+whatever is still connected.
+
+```zig
+var server: loom.Loom(Handler) = undefined;
+
+fn onShutdownSignal(_: std.posix.SIG) callconv(.c) void {
+    server.stop();
+}
+
+var action = std.posix.Sigaction{
+    .handler = .{ .handler = onShutdownSignal },
+    .mask = std.posix.sigemptyset(),
+    .flags = 0, // no SA_RESTART, so a blocking wait also returns EINTR
+};
+std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+std.posix.sigaction(std.posix.SIG.INT, &action, null);
+```
+
+Loom does not install handlers itself. Signal disposition is
+process-global and belongs to the application, not to a library it
+happens to link. Both examples wire it up; CI starts each one, serves a
+request, sends `SIGTERM` and requires a clean exit.
 
 ## Behaviour worth knowing
 
@@ -197,9 +225,13 @@ CI runs the whole suite on Linux and macOS, in both `Debug` and
 test that starts each example and makes a real request against it.
 
 The end-to-end suite stands up real servers on ephemeral ports and drives
-them over real sockets, including disconnect storms, saturation, and
-timeout expiry. Every regression test in it was verified by
-re-introducing the bug it guards.
+them over real sockets — disconnect storms, saturation, timeout expiry,
+slow readers, multi-worker churn. Every regression test in it was proven
+to fail: the bug it guards was re-introduced and the test watched to go
+red. [TESTING.md](TESTING.md) documents the method, the full injection
+matrix, the cases where the *tests themselves* turned out to be lying,
+and the coverage gaps that remain.
+
 
 ## Status
 

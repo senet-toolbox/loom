@@ -77,5 +77,6 @@
         "examples",
         "README.md",
         "LICENSE",
+        "TESTING.md",
     },
 }

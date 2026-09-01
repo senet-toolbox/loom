@@ -6,6 +6,11 @@ const timestamp = Time.timestamp;
 pub const Logger = @This();
 mutex: std.Io.Mutex,
 
+/// Where formatted lines go. `null` means stderr, which is what a server
+/// wants; tests point it at a buffer so they can assert on the output
+/// instead of just watching it scroll past.
+sink: ?*std.Io.Writer = null,
+
 const LogLevel = enum {
     DEBUG,
     WARN,
@@ -30,6 +35,11 @@ pub fn init(target: *Logger) void {
     };
 }
 
+/// Redirect output, for tests. Pass `null` to go back to stderr.
+pub fn setSink(logger: *Logger, sink: ?*std.Io.Writer) void {
+    logger.sink = sink;
+}
+
 fn log(
     logger: *Logger,
     log_level: LogLevel,
@@ -50,7 +60,13 @@ fn log(
     }
     nosuspend stderr.print(fmt, args) catch return;
     nosuspend stderr.print("\n", .{}) catch return;
-    std.debug.print("{s}", .{stderr.buffer[0..stderr.end]});
+
+    const line = stderr.buffer[0..stderr.end];
+    if (logger.sink) |sink| {
+        nosuspend sink.writeAll(line) catch return;
+    } else {
+        std.debug.print("{s}", .{line});
+    }
     try stderr.flush();
 }
 
@@ -96,14 +112,33 @@ pub fn err(
 }
 
 test "all logs" {
+    // Captured rather than printed: a test that writes to the real stderr
+    // makes the build runner echo the whole command back as if something
+    // had failed, and it asserts nothing beyond "did not crash".
+    var buf: [4096]u8 = undefined;
+    var capture = std.Io.Writer.fixed(&buf);
+
     var logger: Logger = undefined;
     logger.init();
+    logger.setSink(&capture);
+
     try logger.warn("Panic in the building {s}", .{"Escape now"}, null);
     try logger.debug("Here are the logs for age {d}", .{24}, null);
     try logger.info("INFO {s}", .{"accessing"}, null);
     try logger.err("ERROR {s}", .{"accessing"}, null);
     try logger.fatal("FATAL {s}", .{"accessing"}, @src());
+
+    const out = buf[0..capture.end];
+    for ([_][]const u8{ "WARN", "DEBUG", "INFO", "ERROR", "FATAL" }) |level| {
+        try std.testing.expect(std.mem.indexOf(u8, out, level) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, out, "Escape now") != null);
+    // `@src()` was passed only to `fatal`, so the location belongs to it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Logger.zig:") != null);
+
+    // Formatting of non-trivial arguments still has to work.
     const vec1: @Vector(5, i32) = .{ 1, 2, 3, 4, 5 };
     const vec2: @Vector(5, i32) = .{ 6, 7, 8, 9, 10 };
     try logger.info("INFO {any}", .{vec1 + vec2}, null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..capture.end], "7") != null);
 }

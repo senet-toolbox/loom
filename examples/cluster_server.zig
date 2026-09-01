@@ -9,6 +9,7 @@
 //! already busy.
 
 const std = @import("std");
+const posix = std.posix;
 const loom = @import("loom");
 
 /// One handler per worker.
@@ -35,6 +36,28 @@ const Handler = struct {
     }
 };
 
+/// Reachable from the signal handler, which gets no arguments.
+var cluster: loom.Cluster(*Handler) = undefined;
+
+/// `Cluster.stop` signals every worker: one atomic store and one wake
+/// syscall each. Safe to do from a signal handler, and safe to do while
+/// the workers are mid-batch.
+fn onShutdownSignal(_: posix.SIG) callconv(.c) void {
+    cluster.stop();
+}
+
+/// Loom does not install signal handlers itself — signal disposition is
+/// process-global and belongs to the application.
+fn handleShutdownSignals() void {
+    var action = posix.Sigaction{
+        .handler = .{ .handler = onShutdownSignal },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.TERM, &action, null); // docker stop, systemd
+    posix.sigaction(posix.SIG.INT, &action, null); // ctrl-c
+}
+
 pub fn main() !void {
     // Workers allocate concurrently, so the allocator has to be
     // thread-safe. `smp_allocator` is built for exactly this.
@@ -50,7 +73,6 @@ pub fn main() !void {
     }
     defer for (handlers) |h| allocator.destroy(h);
 
-    var cluster: loom.Cluster(*Handler) = undefined;
     try cluster.init(.{
         .server_addr = "127.0.0.1",
         .server_port = 8081,
@@ -65,6 +87,10 @@ pub fn main() !void {
         .{ cluster.boundPort(), worker_count },
     );
 
-    // Runs until `cluster.stop()` is called from another thread.
+    handleShutdownSignals();
+
+    // Returns once a shutdown signal arrives; `deinit` then joins every
+    // worker and closes what is still open.
     try cluster.serve();
+    std.debug.print("shut down cleanly\n", .{});
 }
