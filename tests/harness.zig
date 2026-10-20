@@ -36,6 +36,18 @@ pub fn sleepMs(ms: u64) void {
 /// never does — a loop that ignores `stop` should fail the test, not hang
 /// the suite. The stuck thread is detached on that path so the process
 /// can still exit and report.
+/// Wait until `value` reaches at least `want`, or fail with
+/// `error.WaitTimedOut` after `timeout_ms`. For state another thread
+/// advances, such as a count of handled requests or of tasks run.
+pub fn waitForAtLeast(value: *const std.atomic.Value(u32), want: u32, timeout_ms: u64) !void {
+    const step_ms = 2;
+    var waited: u64 = 0;
+    while (value.load(.acquire) < want) : (waited += step_ms) {
+        if (waited >= timeout_ms) return error.WaitTimedOut;
+        sleepMs(step_ms);
+    }
+}
+
 pub fn joinWithin(thread: std.Thread, done: *std.atomic.Value(bool), timeout_ms: u64) !void {
     const step_ms = 5;
     var waited: u64 = 0;
@@ -203,6 +215,14 @@ pub fn Server(comptime Handler: type) type {
         /// across a whole server lifecycle rather than just across
         /// `new`/`deinit`.
         pub fn stop(self: *Self) void {
+            self.halt();
+            self.release();
+        }
+
+        /// Stop the loop and join its thread, leaving the server's state
+        /// in place, so a test can act between the loop exiting and
+        /// `deinit`. Finish with `release`.
+        pub fn halt(self: *Self) void {
             self.loom.stop();
             // Panic rather than block forever: a loop that ignores `stop`
             // is a bug this suite exists to surface, and a hung run
@@ -210,6 +230,10 @@ pub fn Server(comptime Handler: type) type {
             joinWithin(self.thread, self.done, 5_000) catch {
                 @panic("server loop did not stop within 5s");
             };
+        }
+
+        /// `deinit` a halted server and free it.
+        pub fn release(self: *Self) void {
             self.loom.deinit();
             self.allocator.destroy(self.loom);
             self.allocator.destroy(self.done);

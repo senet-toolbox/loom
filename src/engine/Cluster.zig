@@ -54,6 +54,7 @@ pub fn Cluster(comptime Handler: type) type {
             initial_read_size: usize = 16 * 1024,
             max_read_size: usize = 2097152,
             idle_timeout_ms: i64 = 60_000,
+            reply_timeout_ms: i64 = 300_000,
             backlog: u31 = 4096,
         };
 
@@ -107,6 +108,7 @@ pub fn Cluster(comptime Handler: type) type {
                     .initial_read_size = config.initial_read_size,
                     .max_read_size = config.max_read_size,
                     .idle_timeout_ms = config.idle_timeout_ms,
+                    .reply_timeout_ms = config.reply_timeout_ms,
                     .slot_base = slot_base,
                 }, allocator, handlers[created]);
                 try workers[created].adoptListener(listener);

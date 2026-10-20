@@ -210,6 +210,8 @@ pub fn newClient(self: *KQueue, client: *Client) !void {
     });
 }
 
+/// Stop reporting writability and, unless the client has paused reads,
+/// report readability again. A paused client ends up with neither.
 pub fn readMode(self: *KQueue, client: *Client) !void {
     if (client.socket < 0) return error.InvalidSocket;
     try self.queueChange(.{
@@ -223,7 +225,7 @@ pub fn readMode(self: *KQueue, client: *Client) !void {
     try self.queueChange(.{
         .ident = @intCast(client.socket),
         .filter = system.EVFILT.READ,
-        .flags = system.EV.ADD | system.EV.ENABLE,
+        .flags = system.EV.ADD | @as(@TypeOf(self.change_list[0].flags), if (client.reads_paused) system.EV.DISABLE else system.EV.ENABLE),
         .fflags = 0,
         .data = 0,
         .udata = @intFromPtr(client),

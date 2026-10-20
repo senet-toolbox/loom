@@ -129,6 +129,7 @@ curl -i http://127.0.0.1:8081/
 | `initial_read_size` | `16 KiB` | Size of a connection's read buffer at accept. |
 | `max_read_size` | `2 MiB` | Ceiling a connection's read buffer may grow to. |
 | `idle_timeout_ms` | `60_000` | Drop connections that make no progress for this long. `0` disables. |
+| `reply_timeout_ms` | `300_000` | Drop connections that have awaited a reply (`awaitReply`) for this long. Replaces `idle_timeout_ms` while waiting. `0` disables. |
 
 ## API
 
@@ -142,6 +143,13 @@ curl -i http://127.0.0.1:8081/
   handler while the loop is parked; `serve()` returns once the in-flight
   batch is done. See *Shutdown* below.
 - `deinit()` — close live connections, the listener, and release everything.
+  Runs any posted tasks the loop did not, after the connections are closed.
+- `post(task)` — run `task` on the loop thread. Safe from any thread. See
+  *Replying later*.
+- `clientAt(slot, generation)` — the live connection with that identity,
+  or null if it has closed. Loop thread only.
+- `awaitReply(client)` / `finishReply(client)` — put a connection on the
+  reply deadline instead of the idle one, and back. Loop thread only.
 
 On a `*Client`:
 
@@ -160,6 +168,93 @@ On a `*Client`:
 - `slot` — dense connection index in `0..max`, stable for the
   connection's lifetime and never shared with another live connection.
   Useful as a key for your own per-connection state.
+- `generation` — tells this connection apart from every other that has
+  held the same `slot`. With `slot`, the address of a later reply.
+- `pauseReads()` / `resumeReads()` — stop and restart reading from the
+  connection. Further bytes wait in the kernel, so TCP pushes back on the
+  peer.
+
+## Replying later
+
+`process` runs on the loop thread, and the loop waits for it. A handler
+that waits on something slow — a child process, an outbound HTTPS call —
+stalls every connection on that loop until it returns. Non-blocking
+sockets do not help, and `Cluster` only divides the stall.
+
+Instead, hand the slow work to a thread of your own and answer when it
+is done. Only the loop thread may touch sockets, so the answer travels
+back with `post`:
+
+```zig
+const Reply = struct {
+    task: loom.Task = .{ .run = run },
+    server: *loom.Loom(Handler),
+    slot: usize,
+    generation: u32,
+    body: []u8, // owned; filled in by the worker
+
+    // On the loop thread.
+    fn run(task: *loom.Task) void {
+        const self: *Reply = @fieldParentPtr("task", task);
+        defer {
+            gpa.free(self.body);
+            gpa.destroy(self);
+        }
+        // Null if the connection closed meanwhile, even if a new one has
+        // since taken its slot.
+        const client = self.server.clientAt(self.slot, self.generation) orelse return;
+        client.write(self.body) catch return self.server.closeClient(client);
+        self.server.finishReply(client);
+        client.resumeReads() catch self.server.closeClient(client);
+    }
+};
+
+// In `process`, on the loop thread:
+try client.pauseReads();       // nothing pipelined behind this is served yet
+server.awaitReply(client);     // reply deadline, not idle deadline
+try jobs.submit(.{ .slot = client.slot, .generation = client.generation });
+
+// On the worker thread, when the job is done:
+reply.body = result;
+server.post(&reply.task);
+```
+
+The pieces:
+
+- **`post(task)`** queues a `loom.Task` and wakes the loop, which runs it
+  between event batches. Tasks from one thread run in order. The task is
+  intrusive — embed it and recover the outer struct with
+  `@fieldParentPtr` — and the caller keeps it alive until it runs. Every
+  posted task runs exactly once, by the loop or by `deinit`, so a task
+  may free itself. Not signal-safe; it takes a lock.
+- **`clientAt(slot, generation)`** finds the connection again. Keep the
+  slot and generation, not the `*Client`: by the time a reply arrives the
+  connection may have closed and its pooled memory gone to a new one,
+  and a stored pointer would send one user's response to another.
+- **`pauseReads`** stops the connection being served again while its
+  request is worked on, so a pipelined request behind it cannot be
+  answered first. The loop stops delivering bytes as soon as `process`
+  returns; a response already draining keeps draining, and reads stay
+  off after it does.
+- **`awaitReply`** swaps the idle deadline for `reply_timeout_ms`. A
+  connection waiting on slow work makes no progress by design, and the
+  idle timeout would otherwise drop it. If the reply timeout passes first
+  the connection is closed, and the late reply finds `clientAt` null.
+
+The worker pool is not Loom's: it needs nothing from the loop, and its
+size and policy belong to the application. A fixed set of `std.Thread`s
+reading a bounded `std.Io.Queue` is enough, with one pool per kind of
+work so slow work cannot starve other work.
+
+**Shutdown order.** `stop()` the loop, then stop and join every thread
+that can `post`, then `deinit()`. `deinit` closes every connection and
+then runs whatever was posted after the loop stopped; those tasks find
+`clientAt` null and only free themselves. A `post` that races `deinit` is
+a use after free.
+
+Under `Cluster`, each worker is its own `Loom`: post the reply to the
+worker that owns the connection. Slots are unique server-wide, so
+nothing else changes.
 
 ## Shutdown
 

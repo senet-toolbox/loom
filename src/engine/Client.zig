@@ -51,6 +51,22 @@ slot: usize = 0,
 /// skipped instead of touching a freed client.
 closing: bool = false,
 
+/// Distinguishes this connection from every other one that has held, or
+/// will hold, the same `slot`. Stamped by the server on accept. Capture it
+/// with `slot` to find the connection again later through
+/// `Loom.clientAt`.
+generation: u32 = 0,
+
+/// Set by `pauseReads`. While set, the server reads nothing from this
+/// connection, so the peer's further bytes wait in the kernel and TCP
+/// pushes back on it.
+reads_paused: bool = false,
+
+/// Set by `Loom.awaitReply`: the connection is waiting on a reply that
+/// will be written later, and is on the reply deadline rather than the
+/// idle one.
+awaiting: bool = false,
+
 // Used to read length-prefixed messages
 msg: []const u8,
 
@@ -442,8 +458,36 @@ fn pumpWrite(self: *Client) !void {
 pub fn continueWrite(self: *Client) !void {
     try self.pumpWrite();
     if (!self.isWriting()) {
+        // Leaves reads off if they are paused.
         try self.poller.readMode(self);
     }
+}
+
+/// Stop reading from this connection until `resumeReads`.
+///
+/// For a handler that will reply later: bytes the peer pipelines behind
+/// the request being worked on stay in the kernel instead of reaching the
+/// handler, so responses cannot come back out of order. Takes effect from
+/// the current read on -- the server stops delivering data to `process`
+/// as soon as it returns. A response still draining keeps draining, and
+/// finishing it leaves reads off. Idempotent.
+pub fn pauseReads(self: *Client) !void {
+    if (self.reads_paused) return;
+    self.reads_paused = true;
+    // `readMode` honours the flag, so it now disarms reads. While writing
+    // they are already off, and `continueWrite` keeps them off.
+    if (!self.isWriting()) try self.poller.readMode(self);
+}
+
+/// Undo `pauseReads`. Anything the peer sent meanwhile is delivered on
+/// the next loop iteration. If a response is still draining, reads come
+/// back once it has. Idempotent.
+pub fn resumeReads(self: *Client) !void {
+    if (!self.reads_paused) return;
+    self.reads_paused = false;
+    // While writing, the poller is in write mode and `continueWrite`
+    // restores read mode when the response drains.
+    if (!self.isWriting()) try self.poller.readMode(self);
 }
 
 const Reader = struct {

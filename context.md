@@ -8,6 +8,38 @@ on another thread and reply later, without blocking the event loop. Written
 (every regression test is proven to fail with its bug re-introduced). Keep
 to both.
 
+## Status (2026-10-20)
+
+Loom's half (§5 steps 1–4) is done. Next is reverb, §8 of
+`../reverb/context.md`. What was built, by the names reverb will call:
+
+- `loom.Task { run, next }` (exported from `root.zig`) and
+  `Loom.post(*Task)`. FIFO per poster. Drained after each event batch
+  that saw a wake, before `drainCloseQueue`.
+- `deinit` contract: closes every connection, *then* runs tasks posted
+  after the loop stopped (looping, since a task may post), so they see
+  `clientAt` null. Threads that post must be joined before `deinit`.
+- `Client.generation` (u32, per-Loom counter) and
+  `Loom.clientAt(slot, generation) ?*Client`, over a `clients` slot table.
+  Accept asserts the slot's entry is empty.
+- `Client.pauseReads()` / `resumeReads()`. Both backends' `readMode`
+  honour `client.reads_paused`, so `continueWrite` cannot re-arm reads.
+  No new backend function was needed. The loop's read loop breaks as
+  soon as `process` pauses.
+- `Loom.awaitReply(client)` / `finishReply(client)` move the client
+  between the idle list and a separate `awaiting_list` (each list stays
+  sorted because its entries share one duration). Config
+  `reply_timeout_ms`, default 300 000, also on `Cluster.Config`.
+  `touchClient` does nothing while awaiting.
+- Reverb's `deferReply` therefore does: `pauseReads`, `awaitReply`,
+  capture `slot`/`generation`/`*Loom`. The reply task does: `clientAt`,
+  write, `finishReply`, `resumeReads`, then serve buffered requests.
+- 8 new integration tests, all on kqueue and epoll, Debug and
+  ReleaseSafe. Injection results are in `TESTING.md`; the one bug no test
+  catches is `post` waking before it queues (a known gap there).
+- `ThreadRipper.zig` deleted. `Scheduler`/`Fiber` kept: reverb's
+  `context.zig` still imports `xsuspend`.
+
 ---
 
 ## 1. The problem

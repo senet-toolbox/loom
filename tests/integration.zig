@@ -1390,7 +1390,11 @@ test "regression: a payload may be reused the moment write returns" {
     defer allocator.free(got);
     try conn.recvExactly(got);
 
-    // The handler really did overwrite its buffer mid-send.
+    // The handler really did overwrite its buffer mid-send. Waited for,
+    // not read once: a reader that keeps pace can let `write` finish the
+    // whole payload without parking, and then the last bytes can arrive
+    // before the handler's count does.
+    try harness.waitForAtLeast(&ScribbleHandler.scribbled, 1, 2_000);
     try testing.expectEqual(@as(u32, 1), ScribbleHandler.scribbled.load(.monotonic));
     // ...and the peer still got the original bytes.
     try testing.expectEqualSlices(u8, expected, got);
@@ -1492,4 +1496,470 @@ test "large-write copy buffers are released with the connection" {
     }
 
     try testing.expectEqual(std.heap.Check.ok, debug_allocator.deinit());
+}
+
+// ── Replying later ─────────────────────────────────────────────────
+
+/// What `DeferHandler` does with each request.
+const DeferMode = enum {
+    /// Answer at once.
+    reply,
+    /// Defer the first request: pause reads, await a reply, and leave the
+    /// answer to a posted `ReplyTask`. Answer later ones at once with
+    /// their sequence number, so tests can check the order.
+    defer_first,
+    /// As `defer_first`, but start a response too large to send at once
+    /// before deferring, so the deferral spans a parked write.
+    huge_then_defer,
+};
+
+/// A handler that replies later, the way one handing work to a thread
+/// pool does. Records the connection it last saw so tests can address a
+/// reply to it.
+const DeferHandler = struct {
+    // Set before the server starts; the loop thread only reads it.
+    var mode: DeferMode = .reply;
+    var server = std.atomic.Value(?*loom.Loom(DeferHandler)).init(null);
+    var handled = std.atomic.Value(u32).init(0);
+    var last_slot = std.atomic.Value(usize).init(0);
+    var last_generation = std.atomic.Value(u32).init(0);
+    var loop_thread = std.atomic.Value(std.Thread.Id).init(0);
+
+    fn reset(m: DeferMode) void {
+        mode = m;
+        server.store(null, .release);
+        handled.store(0, .release);
+        last_slot.store(0, .release);
+        last_generation.store(0, .release);
+        loop_thread.store(0, .release);
+    }
+
+    pub fn process(_: DeferHandler, client: *loom.Client, _: []const u8) !void {
+        loop_thread.store(std.Thread.getCurrentId(), .release);
+        last_slot.store(client.slot, .release);
+        last_generation.store(client.generation, .release);
+        const n = handled.load(.acquire);
+        defer handled.store(n + 1, .release);
+
+        switch (mode) {
+            .reply => try client.write(small_ok),
+            .defer_first, .huge_then_defer => {
+                if (n == 0) {
+                    if (mode == .huge_then_defer) try client.write(huge_response);
+                    try client.pauseReads();
+                    server.load(.acquire).?.awaitReply(client);
+                } else {
+                    var buf: [64]u8 = undefined;
+                    try client.write(try std.fmt.bufPrint(&buf, numbered_head ++ "{d}", .{n}));
+                }
+            },
+        }
+    }
+};
+
+const small_ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+const numbered_head = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n";
+
+/// The response `DeferHandler` gives request `n`.
+fn numbered(comptime n: u8) []const u8 {
+    return numbered_head ++ [_]u8{'0' + n};
+}
+
+/// Finds a deferred connection again and answers it, the way a worker's
+/// reply does once it is posted back to the loop.
+const ReplyTask = struct {
+    task: loom.Task = .{ .run = run },
+    slot: usize,
+    generation: u32,
+    /// Written if the connection is found. Null just resumes it.
+    body: ?[]const u8 = null,
+    outcome: std.atomic.Value(u32) = .init(pending),
+    ran_on: std.Thread.Id = 0,
+
+    const pending: u32 = 0;
+    const found: u32 = 1;
+    const gone: u32 = 2;
+
+    fn run(task: *loom.Task) void {
+        const self: *ReplyTask = @fieldParentPtr("task", task);
+        self.ran_on = std.Thread.getCurrentId();
+        const srv = DeferHandler.server.load(.acquire).?;
+        const client = srv.clientAt(self.slot, self.generation) orelse {
+            self.outcome.store(gone, .release);
+            return;
+        };
+        if (self.body) |b| client.write(b) catch srv.closeClient(client);
+        srv.finishReply(client);
+        client.resumeReads() catch srv.closeClient(client);
+        self.outcome.store(found, .release);
+    }
+
+    /// Post to the test server and wait for it to run.
+    fn postAndWait(self: *ReplyTask) !u32 {
+        DeferHandler.server.load(.acquire).?.post(&self.task);
+        try harness.waitForAtLeast(&self.outcome, found, 5_000);
+        return self.outcome.load(.acquire);
+    }
+};
+
+fn startDeferServer(
+    allocator: std.mem.Allocator,
+    mode: DeferMode,
+    config: loom.Loom(DeferHandler).Config,
+) !harness.Server(DeferHandler) {
+    DeferHandler.reset(mode);
+    const server = try harness.Server(DeferHandler).start(allocator, .{}, config);
+    DeferHandler.server.store(server.loom, .release);
+    return server;
+}
+
+// `post` exists so a worker thread can hand a result back to the loop,
+// which alone may touch sockets. The loop used to treat a wake as nothing
+// more than "re-check the running flag", so a posted task would never
+// run; and a `post` that ran the task on the spot would run it on the
+// worker, racing the loop.
+test "a task posted from another thread runs, on the loop thread" {
+    const allocator = std.heap.page_allocator;
+    var server = try startDeferServer(allocator, .reply, .{ .max = 4 });
+    defer server.stop();
+
+    // One request, to learn which thread the loop is on.
+    const conn = try server.connect();
+    defer conn.close();
+    try conn.send(harness.get_request);
+    var buf: [64]u8 = undefined;
+    _ = try conn.recv(&buf);
+    const loop_thread = DeferHandler.loop_thread.load(.acquire);
+
+    var task = ReplyTask{ .slot = 1_000_000, .generation = 0 };
+    try testing.expectEqual(ReplyTask.gone, try task.postAndWait());
+    try testing.expectEqual(loop_thread, task.ran_on);
+    try testing.expect(task.ran_on != std.Thread.getCurrentId());
+}
+
+/// Counts its runs, to check each posted task runs exactly once.
+const CountTask = struct {
+    task: loom.Task = .{ .run = run },
+    runs: std.atomic.Value(u32) = .init(0),
+
+    var total = std.atomic.Value(u32).init(0);
+
+    fn run(task: *loom.Task) void {
+        const self: *CountTask = @fieldParentPtr("task", task);
+        _ = self.runs.fetchAdd(1, .monotonic);
+        _ = total.fetchAdd(1, .release);
+    }
+
+    fn postAll(srv: *loom.Loom(DeferHandler), tasks: []CountTask, go: *const std.atomic.Value(bool)) void {
+        // Start together, so the posts collide rather than trickle in as
+        // each thread happens to be spawned.
+        while (!go.load(.acquire)) std.atomic.spinLoopHint();
+        for (tasks) |*t| srv.post(&t.task);
+    }
+};
+
+// Many workers finish at once. An unsynchronised queue loses or repeats
+// tasks under that, and a wake that can fall between the loop taking the
+// queue and parking again strands the last ones until something
+// unrelated wakes the loop.
+test "tasks posted concurrently from many threads each run exactly once" {
+    const allocator = std.heap.page_allocator;
+    var server = try startDeferServer(allocator, .reply, .{ .max = 4, .idle_timeout_ms = 0 });
+    defer server.stop();
+
+    const threads = 8;
+    const per_thread = 5_000;
+    const tasks = try allocator.alloc(CountTask, threads * per_thread);
+    defer allocator.free(tasks);
+
+    for (0..4) |_| {
+        for (tasks) |*t| t.* = .{};
+        CountTask.total.store(0, .release);
+
+        var go = std.atomic.Value(bool).init(false);
+        var posters: [threads]std.Thread = undefined;
+        for (&posters, 0..) |*p, i| {
+            p.* = try std.Thread.spawn(.{}, CountTask.postAll, .{
+                server.loom,
+                tasks[i * per_thread ..][0..per_thread],
+                &go,
+            });
+        }
+        go.store(true, .release);
+        for (posters) |p| p.join();
+
+        try harness.waitForAtLeast(&CountTask.total, threads * per_thread, 10_000);
+        for (tasks) |*t| try testing.expectEqual(@as(u32, 1), t.runs.load(.acquire));
+    }
+}
+
+/// Posts its successor from inside `run`.
+const ChainTask = struct {
+    task: loom.Task = .{ .run = run },
+    next: ?*ChainTask = null,
+    ran: std.atomic.Value(u32) = .init(0),
+
+    fn run(task: *loom.Task) void {
+        const self: *ChainTask = @fieldParentPtr("task", task);
+        self.ran.store(1, .release);
+        if (self.next) |n| DeferHandler.server.load(.acquire).?.post(&n.task);
+    }
+};
+
+// A reply may well post again: a streamed response, or one reply that
+// unblocks the next. Running tasks with the queue's lock held would
+// deadlock the loop on the first one that does.
+test "a task may post another task" {
+    const allocator = std.heap.page_allocator;
+    var server = try startDeferServer(allocator, .reply, .{ .max = 4, .idle_timeout_ms = 0 });
+    defer server.stop();
+
+    var second = ChainTask{};
+    var first = ChainTask{ .next = &second };
+    server.loom.post(&first.task);
+    try harness.waitForAtLeast(&second.ran, 1, 5_000);
+}
+
+// A reply can arrive after its client hung up and a new connection took
+// the slot -- and the pooled `Client` memory, so the old pointer is now
+// the new connection. Delivering it there sends one user's response to
+// another. The generation check is what stops that.
+test "clientAt does not return a closed connection, nor a new one in its slot" {
+    const allocator = std.heap.page_allocator;
+    // One slot, so the second connection must reuse the first's.
+    var server = try startDeferServer(allocator, .reply, .{ .max = 1 });
+    defer server.stop();
+
+    var buf: [64]u8 = undefined;
+
+    const first = try server.connect();
+    try first.send(harness.get_request);
+    _ = try first.recv(&buf);
+    const slot = DeferHandler.last_slot.load(.acquire);
+    const old_generation = DeferHandler.last_generation.load(.acquire);
+    first.close();
+
+    // Once the server has seen the hang-up, the old identity finds
+    // nothing. Polled, since nothing reports when the close is processed.
+    var attempts: usize = 0;
+    while (true) : (attempts += 1) {
+        var probe = ReplyTask{ .slot = slot, .generation = old_generation };
+        if (try probe.postAndWait() == ReplyTask.gone) break;
+        if (attempts >= 1_000) return error.ClosedClientStillFound;
+        harness.sleepMs(2);
+    }
+
+    const second = try server.connect();
+    defer second.close();
+    try second.send(harness.get_request);
+    _ = try second.recv(&buf);
+    try testing.expectEqual(slot, DeferHandler.last_slot.load(.acquire));
+    const new_generation = DeferHandler.last_generation.load(.acquire);
+
+    // The old reply must not reach the new connection...
+    var stale = ReplyTask{ .slot = slot, .generation = old_generation, .body = "STALE" };
+    try testing.expectEqual(ReplyTask.gone, try stale.postAndWait());
+
+    // ...which is still there for its own.
+    var live = ReplyTask{ .slot = slot, .generation = new_generation };
+    try testing.expectEqual(ReplyTask.found, try live.postAndWait());
+
+    // And nothing was written to it.
+    try testing.expect(!try second.waitForClose(100));
+}
+
+// While a request is being worked on elsewhere, the connection must not
+// be served again, or a pipelined request behind it is answered first
+// and the responses come back out of order.
+test "a paused client's pipelined bytes are not delivered until resumed" {
+    const allocator = std.heap.page_allocator;
+    const req = harness.get_request;
+    // A read buffer that holds exactly one request, so the second is
+    // still in the kernel when the first is deferred.
+    var server = try startDeferServer(allocator, .defer_first, .{
+        .max = 4,
+        .initial_read_size = req.len,
+        .max_read_size = req.len,
+    });
+    defer server.stop();
+
+    const conn = try server.connect();
+    defer conn.close();
+
+    // Two requests in one write: the loop must stop reading after the
+    // first rather than read on to the second.
+    try conn.send(req ++ req);
+    try harness.waitForAtLeast(&DeferHandler.handled, 1, 2_000);
+    // A third, separately: new bytes must not re-arm reads either.
+    try conn.send(req);
+    harness.sleepMs(300);
+    try testing.expectEqual(@as(u32, 1), DeferHandler.handled.load(.acquire));
+
+    var reply = ReplyTask{
+        .slot = DeferHandler.last_slot.load(.acquire),
+        .generation = DeferHandler.last_generation.load(.acquire),
+        .body = numbered(0),
+    };
+    try testing.expectEqual(ReplyTask.found, try reply.postAndWait());
+
+    // Resumed, the other two are served, after the reply and in order.
+    const expected = comptime numbered(0) ++ numbered(1) ++ numbered(2);
+    var got: [expected.len]u8 = undefined;
+    try conn.recvExactly(&got);
+    try testing.expectEqualStrings(expected, &got);
+}
+
+// A response that parks flips the connection to write mode, and draining
+// it flips it back to read mode -- which used to mean "reads on". A
+// connection paused while its write was parked must stay paused.
+test "a paused client stays paused when a parked write drains" {
+    const allocator = std.heap.page_allocator;
+
+    const body_len = 8 * 1024 * 1024;
+    const buf = try allocator.alloc(u8, body_len + 128);
+    defer allocator.free(buf);
+    huge_response = try harness.buildResponse(buf, body_len, 'Z');
+
+    var server = try startDeferServer(allocator, .huge_then_defer, .{
+        .max = 4,
+        .max_body_size = body_len + 1024,
+    });
+    defer server.stop();
+
+    const conn = try harness.Conn.openThrottled(server.port, 64 * 1024);
+    defer conn.close();
+
+    try conn.send(harness.get_request);
+    try harness.waitForAtLeast(&DeferHandler.handled, 1, 2_000);
+    // Queued behind the deferred request while its response drains.
+    try conn.send(harness.get_request);
+
+    const got = try allocator.alloc(u8, huge_response.len);
+    defer allocator.free(got);
+    try conn.recvExactly(got);
+
+    // The write has drained. The second request must still wait.
+    harness.sleepMs(300);
+    try testing.expectEqual(@as(u32, 1), DeferHandler.handled.load(.acquire));
+
+    var reply = ReplyTask{
+        .slot = DeferHandler.last_slot.load(.acquire),
+        .generation = DeferHandler.last_generation.load(.acquire),
+    };
+    try testing.expectEqual(ReplyTask.found, try reply.postAndWait());
+
+    var small: [numbered(1).len]u8 = undefined;
+    try conn.recvExactly(&small);
+    try testing.expectEqualStrings(numbered(1), &small);
+}
+
+// A connection waiting on slow work makes no progress by design, so the
+// idle timeout would drop it long before a slow reply arrived. The reply
+// timeout replaces it -- and has to actually fire, or a reply that never
+// comes holds the slot forever.
+test "an awaiting client outlives the idle timeout and is closed at the reply timeout" {
+    const allocator = std.heap.page_allocator;
+    const reply_timeout_ms = 700;
+    var server = try startDeferServer(allocator, .defer_first, .{
+        .max = 4,
+        .idle_timeout_ms = 150,
+        .reply_timeout_ms = reply_timeout_ms,
+    });
+    defer server.stop();
+
+    const conn = try server.connect();
+    defer conn.close();
+    try conn.send(harness.get_request);
+    try harness.waitForAtLeast(&DeferHandler.handled, 1, 2_000);
+    const started = loom.Time.milliTimestamp();
+
+    // Several idle timeouts pass without the server hanging up...
+    try testing.expect(!try conn.waitForClose(450));
+    // ...and then the reply timeout does.
+    try testing.expect(try conn.waitForClose(3_000));
+    try testing.expect(loom.Time.milliTimestamp() - started >= reply_timeout_ms - 100);
+
+    // The reply, arriving late, finds nothing.
+    var late = ReplyTask{
+        .slot = DeferHandler.last_slot.load(.acquire),
+        .generation = DeferHandler.last_generation.load(.acquire),
+        .body = numbered(0),
+    };
+    try testing.expectEqual(ReplyTask.gone, try late.postAndWait());
+}
+
+/// A reply that owns its memory and frees itself when it runs, as a
+/// worker's reply does. One that never runs is a leak.
+const OwnedReply = struct {
+    task: loom.Task = .{ .run = run },
+    allocator: std.mem.Allocator,
+    srv: *loom.Loom(DeferHandler),
+    slot: usize,
+    generation: u32,
+    /// Post another reply from inside this one.
+    chain: bool = false,
+
+    var ran = std.atomic.Value(u32).init(0);
+    var found = std.atomic.Value(u32).init(0);
+
+    fn run(task: *loom.Task) void {
+        const self: *OwnedReply = @fieldParentPtr("task", task);
+        defer self.allocator.destroy(self);
+        _ = ran.fetchAdd(1, .acq_rel);
+        if (self.srv.clientAt(self.slot, self.generation) != null) {
+            _ = found.fetchAdd(1, .acq_rel);
+        }
+        if (self.chain) {
+            const next = self.allocator.create(OwnedReply) catch return;
+            next.* = .{
+                .allocator = self.allocator,
+                .srv = self.srv,
+                .slot = self.slot,
+                .generation = self.generation,
+            };
+            self.srv.post(&next.task);
+        }
+    }
+};
+
+// Workers still finishing at shutdown post replies the stopped loop will
+// never drain. Those replies own memory, so `deinit` has to run them --
+// after closing every connection, so they find their client gone and
+// only free themselves.
+test "tasks posted after the loop stops are run by deinit" {
+    var debug_allocator = std.heap.DebugAllocator(.{}){};
+    const allocator = debug_allocator.allocator();
+
+    {
+        var server = try startDeferServer(allocator, .defer_first, .{ .max = 4 });
+
+        // A connection still awaiting its reply at shutdown.
+        const conn = try server.connect();
+        defer conn.close();
+        try conn.send(harness.get_request);
+        try harness.waitForAtLeast(&DeferHandler.handled, 1, 2_000);
+
+        server.halt();
+
+        OwnedReply.ran.store(0, .release);
+        OwnedReply.found.store(0, .release);
+        const posted = 16;
+        for (0..posted) |i| {
+            const reply = try allocator.create(OwnedReply);
+            reply.* = .{
+                .allocator = allocator,
+                .srv = server.loom,
+                .slot = DeferHandler.last_slot.load(.acquire),
+                .generation = DeferHandler.last_generation.load(.acquire),
+                .chain = i == 0,
+            };
+            server.loom.post(&reply.task);
+        }
+
+        server.release();
+        try testing.expectEqual(@as(u32, posted + 1), OwnedReply.ran.load(.acquire));
+        try testing.expectEqual(@as(u32, 0), OwnedReply.found.load(.acquire));
+    }
+
+    try testing.expectEqual(.ok, debug_allocator.deinit());
 }

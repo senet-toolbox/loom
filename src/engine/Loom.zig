@@ -154,6 +154,20 @@ pub const UnexpectedError = error{
 /// Default for `Config.idle_timeout_ms`: one minute without progress.
 const READ_TIMEOUT_MS = 60_000;
 
+/// Default for `Config.reply_timeout_ms`: five minutes awaiting a reply.
+const REPLY_TIMEOUT_MS = 300_000;
+
+/// A callback to run on a loop's own thread, queued from any thread with
+/// `Loom.post`.
+///
+/// Intrusive: embed it in whatever the callback needs (a reply, a job
+/// result) and recover the outer struct with `@fieldParentPtr`. Nothing
+/// is allocated to queue it.
+pub const Task = struct {
+    run: *const fn (*Task) void,
+    next: ?*Task = null,
+};
+
 const ClientList = Client.ClientList;
 pub var logger: Logger = undefined;
 pub const fd_t = system.fd_t;
@@ -204,6 +218,21 @@ pub fn Loom(comptime Handler: type) type {
         read_timeout_list: ClientList = undefined,
         idle_timeout_ms: i64 = READ_TIMEOUT_MS,
 
+        // Connections awaiting a reply (`awaitReply`), in reply-deadline
+        // order. Kept apart from the idle list because the two deadlines
+        // differ in length, and each list stays sorted only because
+        // every entry in it shares one duration.
+        awaiting_list: ClientList = .{},
+        reply_timeout_ms: i64 = REPLY_TIMEOUT_MS,
+
+        // Live connections by `slot - slot_base`. Set on accept, cleared
+        // on teardown, so `clientAt` answers from live state alone.
+        clients: []?*Client = &.{},
+
+        // Stamped into each accepted client, so a reply addressed to a
+        // connection can tell it apart from a later one in the same slot.
+        next_generation: u32 = 0,
+
         // for creating client
         client_pool: Abstractions.ManagedMemoryPool(Client) = undefined,
         max_body_size: usize,
@@ -226,6 +255,13 @@ pub fn Loom(comptime Handler: type) type {
         // is never freed while later events in the same batch still
         // reference it.
         close_queue: std.array_list.Managed(*Client) = undefined,
+
+        // Tasks queued by `post`, oldest first. The only state in a
+        // `Loom` that other threads touch, so the only state behind a
+        // lock.
+        posted_mutex: std.Io.Mutex = .init,
+        posted_head: ?*Task = null,
+        posted_tail: ?*Task = null,
 
         /// Cheap per-worker counters.
         ///
@@ -283,6 +319,12 @@ pub fn Loom(comptime Handler: type) type {
             /// a reader that stops draining mid-response) from holding a
             /// connection slot forever.
             idle_timeout_ms: i64 = READ_TIMEOUT_MS,
+
+            /// Drop a connection that has been awaiting a reply
+            /// (`awaitReply`) for this long. Replaces `idle_timeout_ms`
+            /// while it waits, since a connection waiting on slow work
+            /// makes no progress by design. Set to 0 to disable.
+            reply_timeout_ms: i64 = REPLY_TIMEOUT_MS,
         };
 
         pub fn new(target: *Loom(Handler), config: Config, arena: Allocator, handler: Handler) !void {
@@ -310,6 +352,10 @@ pub fn Loom(comptime Handler: type) type {
             errdefer close_queue.deinit();
             try close_queue.ensureTotalCapacity(config.max);
 
+            const clients = try arena.alloc(?*Client, config.max);
+            errdefer arena.free(clients);
+            @memset(clients, null);
+
             logger.init();
             target.* = Loom(Handler){
                 .config = config,
@@ -319,6 +365,8 @@ pub fn Loom(comptime Handler: type) type {
                 .read_timeout_list = .{},
                 .client_pool = Abstractions.ManagedMemoryPool(Client).init(arena),
                 .idle_timeout_ms = config.idle_timeout_ms,
+                .reply_timeout_ms = config.reply_timeout_ms,
+                .clients = clients,
                 .slot_base = config.slot_base,
                 .poller = poller,
                 .running = .init(true),
@@ -342,17 +390,31 @@ pub fn Loom(comptime Handler: type) type {
             return self.threaded.io();
         }
 
+        /// Close live connections and the listener, run any posted tasks
+        /// the loop did not, and release everything.
+        ///
+        /// Call it once `serve` has returned. Posted tasks run *after*
+        /// every connection is closed, so `clientAt` returns null for all
+        /// of them: a reply task sees its client gone and only frees
+        /// itself. Anything that can still `post` (worker threads) must be
+        /// stopped before this is called; a post that races `deinit` is a
+        /// use after free.
         pub fn deinit(self: *Loom(Handler)) void {
+            self.running.store(false, .release);
+
             // Tear down anything still connected before the pools go.
-            // Walking the timeout list is how we reach live clients --
-            // the close queue only holds ones already on their way out.
-            var it = self.read_timeout_list.first;
-            while (it) |node| {
-                const next = node.next;
-                self.closeClient(clientFromTimeoutNode(node));
-                it = next;
+            // The slot table is how we reach live clients -- the close
+            // queue only holds ones already on their way out.
+            for (self.clients) |maybe_client| {
+                if (maybe_client) |client| self.closeClient(client);
             }
             self.drainCloseQueue();
+
+            // A task may post another, so drain until none are left.
+            while (self.hasPosted()) {
+                self.drainPosted();
+                self.drainCloseQueue();
+            }
 
             if (self.listener >= 0) {
                 if (self.owns_listener) close(self.listener);
@@ -363,6 +425,8 @@ pub fn Loom(comptime Handler: type) type {
             self.client_pool.deinit();
             self.free_slots.deinit();
             self.close_queue.deinit();
+            self.arena.free(self.clients);
+            self.clients = &.{};
             self.threaded.deinit();
         }
 
@@ -624,6 +688,66 @@ pub fn Loom(comptime Handler: type) type {
             loom.poller.wake();
         }
 
+        /// Queue `task` to run on this loop's thread, from any thread.
+        ///
+        /// `task.run(task)` is called between event batches, so it may
+        /// use everything a handler may: `clientAt`, `Client.write`,
+        /// `closeClient`, and `post` itself. Tasks from one thread run in
+        /// the order they were posted.
+        ///
+        /// The caller owns `task` and must keep it alive until `run` is
+        /// called. Every posted task is run exactly once: by the loop, or
+        /// by `deinit` if the loop has already stopped (see `deinit`). So
+        /// a task may free itself at the end of `run`.
+        ///
+        /// Not signal-safe: it takes a lock. Use `stop` from a signal
+        /// handler.
+        pub fn post(loom: *Loom(Handler), task: *Task) void {
+            task.next = null;
+            const lock_io = loom.io();
+            loom.posted_mutex.lockUncancelable(lock_io);
+            if (loom.posted_tail) |tail| {
+                tail.next = task;
+            } else {
+                loom.posted_head = task;
+            }
+            loom.posted_tail = task;
+            loom.posted_mutex.unlock(lock_io);
+
+            // After the unlock, so the loop never wakes only to wait on
+            // the lock. A wake that lands while the loop is already
+            // draining is not lost: it leaves the wake event pending, and
+            // the next wait returns at once to an empty or refilled list.
+            loom.poller.wake();
+        }
+
+        /// Run every task posted so far.
+        ///
+        /// The list is taken whole under the lock and run outside it, so
+        /// a task that posts another does not deadlock on the lock; the
+        /// new one runs on the next drain.
+        fn drainPosted(loom: *Loom(Handler)) void {
+            const lock_io = loom.io();
+            loom.posted_mutex.lockUncancelable(lock_io);
+            var it = loom.posted_head;
+            loom.posted_head = null;
+            loom.posted_tail = null;
+            loom.posted_mutex.unlock(lock_io);
+
+            while (it) |task| {
+                // Read before running: the task may free itself.
+                it = task.next;
+                task.run(task);
+            }
+        }
+
+        fn hasPosted(loom: *Loom(Handler)) bool {
+            const lock_io = loom.io();
+            loom.posted_mutex.lockUncancelable(lock_io);
+            defer loom.posted_mutex.unlock(lock_io);
+            return loom.posted_head != null;
+        }
+
         /// This function calls listen on the Loom instance.
         pub fn listen(loom: *Loom(Handler)) !void {
             return loom.serve();
@@ -642,11 +766,13 @@ pub fn Loom(comptime Handler: type) type {
                     else => return err,
                 };
 
+                var woken = false;
                 for (ready_events) |ready| {
                     switch (ready.source) {
-                        // Only ever means "re-check the running flag",
-                        // which the enclosing while already does.
-                        .wake => continue,
+                        // Either `stop` (the enclosing while re-checks the
+                        // running flag) or `post` (drained below, once
+                        // the batch is done).
+                        .wake => woken = true,
 
                         .listener => loom.acceptPending(),
 
@@ -690,8 +816,9 @@ pub fn Loom(comptime Handler: type) type {
                                     };
 
                                     // The handler may have closed the client
-                                    // (directly, or by way of a failed write).
-                                    if (client.closing) break;
+                                    // (directly, or by way of a failed write),
+                                    // or paused it to reply later.
+                                    if (client.closing or client.reads_paused) break;
                                 }
                             }
 
@@ -711,6 +838,11 @@ pub fn Loom(comptime Handler: type) type {
                         },
                     }
                 }
+
+                // After the batch, so a task never sees a client that an
+                // event later in the batch is about to close; before the
+                // drain, so a client a task closes is freed this iteration.
+                if (woken) loom.drainPosted();
 
                 // Every event in the batch has been inspected, so no stale
                 // pointers remain. Safe to actually free.
@@ -772,7 +904,9 @@ pub fn Loom(comptime Handler: type) type {
         /// so a slow-but-progressing transfer is never mistaken for a
         /// stalled one.
         fn touchClient(self: *Loom(Handler), client: *Client) void {
-            if (client.closing) return;
+            // An awaiting client is on the reply deadline, which progress
+            // does not extend; `finishReply` moves it back.
+            if (client.closing or client.awaiting) return;
             client.read_timeout = milliTimestamp() + self.idle_timeout_ms;
             self.read_timeout_list.remove(&client.timeout_node);
             self.read_timeout_list.append(&client.timeout_node);
@@ -786,13 +920,25 @@ pub fn Loom(comptime Handler: type) type {
         /// through the normal deferred path, so the caller must drain the
         /// close queue before blocking again.
         pub fn enforceTimeout(self: *Loom(Handler)) i32 {
-            if (self.idle_timeout_ms == 0) return -1;
-
             const now = milliTimestamp();
+            const idle = if (self.idle_timeout_ms == 0) null else self.expireList(&self.read_timeout_list, now);
+            const reply = if (self.reply_timeout_ms == 0) null else self.expireList(&self.awaiting_list, now);
+
+            const remaining = if (idle != null and reply != null)
+                @min(idle.?, reply.?)
+            else
+                idle orelse reply orelse return -1;
+            return std.math.cast(i32, remaining) orelse std.math.maxInt(i32);
+        }
+
+        /// Close every client in `list` whose deadline has passed, and
+        /// return the milliseconds until the next one is due, or null if
+        /// none is pending.
+        fn expireList(self: *Loom(Handler), list: *ClientList, now: i64) ?i64 {
             // Walk with an explicit cursor and never unlink here: nodes
             // are removed by `drainCloseQueue` alone, so there is exactly
-            // one place that can take a client out of this list.
-            var it = self.read_timeout_list.first;
+            // one place that can take a client out of a list.
+            var it = list.first;
             while (it) |node| {
                 const next = node.next;
                 const client = clientFromTimeoutNode(node);
@@ -801,17 +947,66 @@ pub fn Loom(comptime Handler: type) type {
                 // next drain. Skip rather than stall on it.
                 if (!client.closing) {
                     const remaining = client.read_timeout - now;
-                    if (remaining > 0) {
-                        // The list is deadline-ordered, so the first
-                        // client still in the future bounds the wait.
-                        return std.math.cast(i32, remaining) orelse std.math.maxInt(i32);
-                    }
+                    // The list is deadline-ordered, so the first client
+                    // still in the future bounds the wait.
+                    if (remaining > 0) return remaining;
                     self.stats.timed_out += 1;
                     self.closeClient(client);
                 }
                 it = next;
             }
-            return -1;
+            return null;
+        }
+
+        /// The live connection in `slot`, if it is still the one that was
+        /// stamped with `generation` and is not being closed.
+        ///
+        /// This is how a reply finished on another thread finds its
+        /// connection again: capture `client.slot` and
+        /// `client.generation` in the handler, `post` a task, and look
+        /// the client up here, on the loop thread. A connection that
+        /// closed in the meantime returns null even if a new one has
+        /// since taken its slot -- and its pooled `Client` memory -- so a
+        /// late reply can never reach the wrong peer.
+        ///
+        /// Loop thread only.
+        pub fn clientAt(self: *Loom(Handler), slot: usize, generation: u32) ?*Client {
+            if (slot < self.slot_base) return null;
+            const index = slot - self.slot_base;
+            if (index >= self.clients.len) return null;
+            const client = self.clients[index] orelse return null;
+            if (client.generation != generation or client.closing) return null;
+            return client;
+        }
+
+        /// Mark `client` as waiting for a reply that will be written later,
+        /// from a posted task.
+        ///
+        /// While it waits, `idle_timeout_ms` does not apply -- the
+        /// connection is quiet by design -- and `reply_timeout_ms` does
+        /// instead. If that passes first the connection is closed, and
+        /// the late reply finds `clientAt` returning null.
+        ///
+        /// Usually paired with `client.pauseReads()`, so that requests
+        /// pipelined behind this one are not served before it is
+        /// answered. Undo both with `finishReply` and `resumeReads` once
+        /// the reply is written. Idempotent. Loop thread only.
+        pub fn awaitReply(self: *Loom(Handler), client: *Client) void {
+            if (client.closing or client.awaiting) return;
+            client.awaiting = true;
+            client.read_timeout = milliTimestamp() + self.reply_timeout_ms;
+            self.read_timeout_list.remove(&client.timeout_node);
+            self.awaiting_list.append(&client.timeout_node);
+        }
+
+        /// End `awaitReply`: the client is back on the idle deadline,
+        /// counted from now. Idempotent. Loop thread only.
+        pub fn finishReply(self: *Loom(Handler), client: *Client) void {
+            if (client.closing or !client.awaiting) return;
+            client.awaiting = false;
+            self.awaiting_list.remove(&client.timeout_node);
+            client.read_timeout = milliTimestamp() + self.idle_timeout_ms;
+            self.read_timeout_list.append(&client.timeout_node);
         }
 
         pub fn accept(
@@ -1017,12 +1212,18 @@ pub fn Loom(comptime Handler: type) type {
             client.state = .Connected;
             client.client_type = .HTTP;
             client.closing = false;
+            client.generation = self.next_generation;
+            self.next_generation +%= 1;
 
             // Claim a connection slot. Checked non-empty above.
             client.slot = self.free_slots.pop().?;
             errdefer self.free_slots.appendAssumeCapacity(client.slot);
 
             try self.poller.newClient(client);
+            // A free slot with an entry still in it would let `clientAt`
+            // reach a client that has already been torn down.
+            std.debug.assert(self.clients[client.slot - self.slot_base] == null);
+            self.clients[client.slot - self.slot_base] = client;
             self.connected += 1;
             self.stats.accepted += 1;
 
@@ -1073,8 +1274,13 @@ pub fn Loom(comptime Handler: type) type {
                 std.debug.assert(client.slot >= self.slot_base);
                 std.debug.assert(client.slot - self.slot_base < self.max);
                 self.free_slots.appendAssumeCapacity(client.slot);
+                self.clients[client.slot - self.slot_base] = null;
 
-                self.read_timeout_list.remove(&client.timeout_node);
+                if (client.awaiting) {
+                    self.awaiting_list.remove(&client.timeout_node);
+                } else {
+                    self.read_timeout_list.remove(&client.timeout_node);
+                }
                 client.deinit(self.arena);
 
                 // Closing the descriptor drops its kqueue registrations.

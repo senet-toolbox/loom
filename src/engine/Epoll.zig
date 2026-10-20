@@ -127,12 +127,18 @@ pub fn newClient(self: *Epoll, client: *Client) !void {
     );
 }
 
+/// Stop reporting writability and, unless the client has paused reads,
+/// report readability again. A paused client ends up with neither.
+///
+/// Re-adding `EPOLLIN` re-checks readiness, so bytes that arrived while
+/// reads were off are reported at once, edge trigger notwithstanding.
 pub fn readMode(self: *Epoll, client: *Client) !void {
     if (client.socket < 0) return error.InvalidSocket;
+    const in: u32 = if (client.reads_paused) 0 else linux.EPOLL.IN;
     try self.ctl(
         linux.EPOLL.CTL_MOD,
         client.socket,
-        linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.RDHUP,
+        in | linux.EPOLL.ET | linux.EPOLL.RDHUP,
         @intFromPtr(client),
     );
 }

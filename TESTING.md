@@ -77,9 +77,27 @@ test, watch it go red.
 | `write` borrows the caller's payload | a payload may be reused the moment write returns |
 | `max_body_size` not enforced | writes beyond max_body_size are refused, not truncated |
 | Large-write copy buffer leaked on close | large-write copy buffers are released with the connection |
+| Posted tasks never drained after a wake | a task posted from another thread runs, on the loop thread |
+| `post` runs the task on the poster's thread | a task posted from another thread runs, on the loop thread |
+| Post queue unsynchronised | tasks posted concurrently from many threads each run exactly once |
+| Tasks run with the queue lock held | a task may post another task |
+| Generation never bumped on accept | clientAt does not return a closed connection, nor a new one in its slot |
+| `clientAt` ignores the generation | clientAt does not return a closed connection, nor a new one in its slot |
+| Slot table not cleared on close | clientAt does not return a closed connection, nor a new one in its slot |
+| Read loop keeps reading after the handler paused | a paused client's pipelined bytes are not delivered until resumed |
+| `readMode` ignores the pause (kqueue, epoll) | a paused client's pipelined bytes are not delivered until resumed; a paused client stays paused when a parked write drains |
+| `continueWrite` re-arms reads on a paused client | a paused client stays paused when a parked write drains |
+| `resumeReads` never re-arms | a paused client's pipelined bytes are not delivered until resumed |
+| Idle timeout applied while awaiting a reply | an awaiting client outlives the idle timeout and is closed at the reply timeout |
+| Reply timeout never enforced | an awaiting client outlives the idle timeout and is closed at the reply timeout |
+| `deinit` ignores tasks posted after stop | tasks posted after the loop stops are run by deinit |
+| `deinit` runs those tasks before closing connections | tasks posted after the loop stops are run by deinit |
 
 Backend-specific rows were verified on the platform that owns them;
-`write`-ownership and read/write-mode rows were verified on both.
+`write`-ownership and read/write-mode rows were verified on both. The
+replying-later rows were all verified on both, Linux in Docker; the
+unsynchronised-queue row was run ten times on each and caught ten of
+ten.
 
 ## What went wrong
 
@@ -126,6 +144,39 @@ used `timeout`, which does not exist on macOS. Every invocation exited
 The numbers were meaningless in both directions until it was rerun with a
 real watchdog.
 
+**The same harness bug, a second time.** The replying-later injections
+first ran each test by passing `--test-filter` to the built test binary.
+In Zig 0.16 the filter is a compile-time option; the binary panics on the
+unknown argument. Every injection "failed" and so every bug was
+"caught" — and so was the *restored* tree, which is the only reason it
+was noticed. The injector now builds with the filter, and refuses to
+start unless every target test passes alone on the untouched tree first.
+Two injections that did not compile had likewise been counted as caught;
+a build failure now stops the run instead.
+
+**A guard that hid the rule it guarded.** The loop first refused to read
+a paused client even when the poller reported it readable. With that
+guard, breaking the pause rule in `readMode` on either backend passed the
+whole suite: the guard swallowed the event. Correct poller state already
+keeps those events from happening, so the guard went and the backend
+rule is what the tests now pin.
+
+**A slot-table bug no behaviour could see.** Not clearing a connection's
+entry in the slot table on close passed every test: the stale entry
+pointed at pooled memory still marked `closing`, so `clientAt` returned
+null anyway, and the pool and the free-slot list both recycle last-in
+first-out, so the slot and its memory are always reused together. An
+assertion on accept that the slot is empty turns it into a panic the
+`clientAt` test reaches.
+
+**A flaky test unrelated to the change.** One ReleaseSafe run failed
+`a payload may be reused the moment write returns` (1 in 200, against 0
+in 200 on the previous commit — indistinguishable). The test read the
+handler's counter once, after receiving the whole response, assuming the
+send had parked. A reader that keeps pace lets `write` finish all 8 MiB
+without parking, and then the last bytes can land before the count. It
+now waits for the counter.
+
 **Load generators as the bottleneck.** Throughput numbers from
 connection-churn benchmarks did not correlate with the server's own
 accept counts — roughly 2× apart — because the generator was doing as
@@ -152,6 +203,16 @@ Stated because a coverage claim is only worth the exceptions it admits.
   worker to take a share rather than pinning percentages.
 - **Outbound websocket `permessage-deflate` is not covered** because it
   is not implemented on Zig 0.16; that test skips.
+- **`post` waking before it queues is not caught.** Moving the wake
+  ahead of the insert opens a lost wakeup: the loop can wake, find the
+  queue empty, and park with the task stranded. The window is the
+  insert, tens of nanoseconds, against the microseconds the loop takes
+  to return from `kevent`/`epoll_wait`, so the injected bug passed every
+  run on both platforms. The order is guarded by the comment in `post`,
+  not by a test.
+- **The "unsynchronised queue" injection that removes only the lock**
+  is caught, but by unlocking a mutex that was never locked, not by the
+  race. The variant that removes lock and unlock both is the real check.
 
 ## Measurements
 
